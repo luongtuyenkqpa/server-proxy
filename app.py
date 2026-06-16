@@ -7,7 +7,8 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 
 try:
     os.environ['TZ'] = 'Asia/Ho_Chi_Minh'
-    time.tzset()
+    if hasattr(time, 'tzset'):
+        time.tzset()
 except: pass
 
 app = Flask(__name__)
@@ -31,7 +32,6 @@ def send_telegram_event(event_type, data):
         try:
             session_req = requests.Session()
             msg = ""
-            
             if event_type == "create":
                 msg = f"🌟 <b>KEY VỪA ĐƯỢC TẠO</b> 🌟\n\n🔑 <code>{escape(str(data.get('key')))}</code>\n⏳ Hạn: {escape(str(data.get('exp')))}\n📱 Thiết bị tối đa: {escape(str(data.get('max_dev')))}"
             elif event_type == "banned":
@@ -46,7 +46,6 @@ def send_telegram_event(event_type, data):
                 msg = f"🎉 <b>KHÁCH VỪA VƯỢT LINK THÀNH CÔNG</b> 🎉\n\n🎮 Game: {escape(str(data.get('game')))}\n🔑 Key VIP: <code>{escape(str(data.get('key')))}</code>\n⏱️ Thời hạn: {escape(str(data.get('hours')))}\n🌐 IP: {escape(str(data.get('ip')))}"
 
             if not msg: return
-            
             url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
             payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}
             headers = {"User-Agent": "LVT-Core-Encrypted-Server/3.0", "X-Security-Cipher": secrets.token_hex(32)}
@@ -166,7 +165,6 @@ active_sessions = {}
 api_rate_cache = {}
 used_signatures = {} 
 admin_login_attempts = {}
-
 bypass_sessions = {}
 
 GLOBAL_DB = {}
@@ -231,6 +229,7 @@ def load_db():
                 if "proxy_yaml_loader" not in data["settings"]: data["settings"]["proxy_yaml_loader"] = ""
                 if "msg_login" not in data["settings"]: data["settings"]["msg_login"] = "VUI LÒNG KÍCH HOẠT KEY ĐỂ VÀO GAME!"
                 if "msg_ingame" not in data["settings"]: data["settings"]["msg_ingame"] = "SẴN SÀNG CHIẾN ĐẤU - KEY ĐANG HOẠT ĐỘNG"
+                if "termux_api_url" not in data["settings"]: data["settings"]["termux_api_url"] = ""
 
                 if "admin" not in data["users"]: data["users"]["admin"] = {"password_hash": hash_pwd("120510@"), "role": "admin"}
 
@@ -308,9 +307,7 @@ def firewall_and_csrf():
             return
 
         ua = (request.headers.get('User-Agent') or '').lower()
-        
-        if 'lvt-core-keepalive' in ua:
-            return
+        if 'lvt-core-keepalive' in ua: return
 
         blocked_bots = ['curl', 'postman', 'python', 'nmap', 'sqlmap', 'masscan', 'zgrab', 'wget', 'urllib', 'nikto']
         if any(bot in ua for bot in blocked_bots): 
@@ -379,24 +376,49 @@ def check_proxy_status():
         "loader_url": f"{WEB_URL}/api/loader.yaml?key={key}"
     })
 
+# --- API CHUYÊN DỤNG ĐỂ GỌI XUỐNG TERMUX ---
+@app.route('/api/proxy/activate_action', methods=['POST'])
+def api_activate_action():
+    data = request.json or {}
+    key = data.get('key', '').strip()
+    client_ip = get_real_ip()
+    
+    db = load_db()
+    now = int(time.time() * 1000)
+    
+    if not key or key not in db.get("keys", {}):
+        return jsonify({"status": "error", "message": "Mã Key không hợp lệ!"})
+        
+    kd = db["keys"][key]
+    if kd.get("status") == "banned" or (kd.get("exp") != "permanent" and kd.get("exp") != "pending" and kd.get("exp", 0) < now):
+        return jsonify({"status": "error", "message": "Key đã hết hạn sử dụng hoặc bị khóa!"})
+        
+    termux_url = db.get("settings", {}).get("termux_api_url", "").strip()
+    if not termux_url:
+        return jsonify({"status": "success", "message": "Bỏ qua kết nối Termux (Chưa cấu hình API). Đang vào sảnh...", "redirect": f"/webview?key={key}"})
+    
+    if not termux_url.endswith('/api/termux/activate_game'):
+        termux_url = termux_url.rstrip('/') + '/api/termux/activate_game'
+        
+    try:
+        res = requests.post(termux_url, json={"ip": client_ip}, timeout=6)
+        if res.status_code == 200:
+            return jsonify({"status": "success", "message": "Đã mở cổng Termux! Nhân vật đang hiển thị...", "redirect": f"/webview?key={key}"})
+        else:
+            return jsonify({"status": "error", "message": f"Lỗi từ máy chủ Termux: {res.status_code}"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": "Không kết nối được tới Termux! Hãy kiểm tra lại link Pinggy/Ngrok trong C-Panel."})
+
 @app.route('/api/proxy.yaml')
 def download_proxy_yaml():
     key = request.args.get('key', '').strip()
     db = load_db()
     now = int(time.time() * 1000)
-    
-    if not key or key not in db.get("keys", {}):
-        return "Key không hợp lệ hoặc không được cung cấp.", 403
-        
+    if not key or key not in db.get("keys", {}): return "Key không hợp lệ hoặc không được cung cấp.", 403
     kd = db["keys"][key]
-    if kd.get("status") == "banned":
-        return "Key đã bị khoá.", 403
-    if kd.get("exp") != "permanent" and kd.get("exp") != "pending" and kd.get("exp", 0) < now: 
-        return "Key đã hết hạn.", 403
-        
-    yaml_content = db.get("settings", {}).get("proxy_yaml", "")
-    yaml_content = yaml_content.replace("{KEY}", key)
-    
+    if kd.get("status") == "banned": return "Key đã bị khoá.", 403
+    if kd.get("exp") != "permanent" and kd.get("exp") != "pending" and kd.get("exp", 0) < now: return "Key đã hết hạn.", 403
+    yaml_content = db.get("settings", {}).get("proxy_yaml", "").replace("{KEY}", key)
     resp = make_response(yaml_content)
     resp.headers['Content-Type'] = 'text/yaml; charset=utf-8'
     resp.headers['Content-Disposition'] = f'attachment; filename="proxy_{key}.yaml"'
@@ -407,77 +429,29 @@ def download_loader_yaml():
     key = request.args.get('key', '').strip()
     db = load_db()
     now = int(time.time() * 1000)
-    
-    if not key or key not in db.get("keys", {}):
-        return "Key không hợp lệ hoặc không được cung cấp.", 403
-        
+    if not key or key not in db.get("keys", {}): return "Key không hợp lệ hoặc không được cung cấp.", 403
     kd = db["keys"][key]
-    if kd.get("status") == "banned":
-        return "Key đã bị khoá.", 403
-    if kd.get("exp") != "permanent" and kd.get("exp") != "pending" and kd.get("exp", 0) < now: 
-        return "Key đã hết hạn.", 403
-        
-    yaml_content = db.get("settings", {}).get("proxy_yaml_loader", "")
-    yaml_content = yaml_content.replace("{KEY}", key)
-    
+    if kd.get("status") == "banned": return "Key đã bị khoá.", 403
+    if kd.get("exp") != "permanent" and kd.get("exp") != "pending" and kd.get("exp", 0) < now: return "Key đã hết hạn.", 403
+    yaml_content = db.get("settings", {}).get("proxy_yaml_loader", "").replace("{KEY}", key)
     resp = make_response(yaml_content)
     resp.headers['Content-Type'] = 'text/yaml; charset=utf-8'
     resp.headers['Content-Disposition'] = f'attachment; filename="loader_{key}.yaml"'
     return resp
 
-@app.route('/api/get_script')
-def serve_custom_script():
-    db = load_db()
-    user_script = db.get("settings", {}).get("script_tiem", "")
-    kick_payload = f"""
-    (function() {{
-        setInterval(function() {{
-            fetch('{WEB_URL}/api/check_ban_status', {{cache: 'no-store'}})
-            .then(r => r.json())
-            .then(d => {{
-                if(d.banned) {{
-                    localStorage.removeItem('lvt_proxy_key');
-                    alert("⚠️ LVT HỆ THỐNG: " + d.reason);
-                    window.location.href = "https://google.com";
-                }}
-            }}).catch(e => {{}});
-        }}, 10000); 
-    }})();
-    """
-    resp = make_response(kick_payload + "\n" + user_script)
-    resp.headers['Content-Type'] = 'application/javascript; charset=utf-8'
-    return resp
-
-@app.route('/api/vm_payload')
-def get_vm_payload():
-    db = load_db()
-    script = db.get("settings", {}).get("vm_loader", "")
-    resp = make_response(script)
-    resp.headers['Content-Type'] = 'application/javascript; charset=utf-8'
-    return resp
-
-@app.route('/api/download_pak')
-def download_pak():
-    pak_path = './uploaded.pak'
-    if not os.path.exists(pak_path): return "File không tồn tại trên hệ thống", 404
-    return send_file(pak_path, as_attachment=True, download_name='data.pak')
-
 @app.route('/webview')
 def serve_webview_app():
     db = load_db()
     is_maintenance = db.get("settings", {}).get("webview_maintenance", False)
-    
     if is_maintenance:
         html_content = f"""<!DOCTYPE html><html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>App Maintenance</title><style>body {{ background: #f8fafc; color: #0f172a; display: flex; flex-direction: column; justify-content: center; align-items: center; height: 100vh; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; text-align: center; margin: 0; }} .pulse {{ width: 70px; height: 70px; background: #0f172a; border-radius: 50%; animation: pulse-anim 2s infinite; margin-bottom: 20px; box-shadow: 0 0 20px rgba(15, 23, 42, 0.2); }} @keyframes pulse-anim {{ 0% {{ transform: scale(0.95); box-shadow: 0 0 0 0 rgba(15, 23, 42, 0.4); }} 70% {{ transform: scale(1); box-shadow: 0 0 0 20px rgba(15, 23, 42, 0); }} 100% {{ transform: scale(0.95); box-shadow: 0 0 0 0 rgba(15, 23, 42, 0); }} }} h2 {{ letter-spacing: 1px; }} p {{ color: #64748b; font-size: 14px; margin-top: 5px; }}</style></head><body><div class="pulse"></div><h2>Đang update online app</h2><p>Hệ thống đang được nâng cấp, vui lòng quay lại sau!</p></body></html>"""
     else:
         html_content = db.get("settings", {}).get("app_webview_code", "<h1>Hệ thống chưa được nạp giao diện WebView. Vui lòng liên hệ Admin!</h1>")
-        
         auto_check_script = f"""
         <script>
             (function() {{
                 const checkInterval = 5000;
                 let isLobbyLocked = false;
-                
                 function createLobbyOverlay(msg) {{
                     if(document.getElementById('lvt-lobby-lock')) return;
                     let overlay = document.createElement('div');
@@ -487,20 +461,17 @@ def serve_webview_app():
                     document.body.appendChild(overlay);
                     isLobbyLocked = true;
                 }}
-                
                 function removeLobbyOverlay() {{
                     let overlay = document.getElementById('lvt-lobby-lock');
                     if(overlay) overlay.remove();
                     isLobbyLocked = false;
                 }}
-                
                 setInterval(function() {{
                     let key = localStorage.getItem('lvt_proxy_key') || '';
                     if(!key) {{
                         let urlParams = new URLSearchParams(window.location.search);
                         key = urlParams.get('key') || '';
                     }}
-                    
                     fetch('{WEB_URL}/api/proxy/status?key=' + key)
                     .then(r => r.json())
                     .then(d => {{
@@ -514,11 +485,8 @@ def serve_webview_app():
             }})();
         </script>
         """
-        if "</body>" in html_content.lower():
-            html_content = re.sub(r'</body>', auto_check_script + '\n</body>', html_content, flags=re.IGNORECASE)
-        else:
-            html_content += auto_check_script
-
+        if "</body>" in html_content.lower(): html_content = re.sub(r'</body>', auto_check_script + '\n</body>', html_content, flags=re.IGNORECASE)
+        else: html_content += auto_check_script
     resp = make_response(html_content)
     resp.headers['Content-Type'] = 'text/html; charset=utf-8'
     return resp
@@ -540,238 +508,36 @@ def get_key_portal():
         <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
         <style>
             @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap');
-            
-            html, body {{ 
-                background-color: #f5f5f5; 
-                font-family: 'Roboto', sans-serif; 
-                margin: 0; 
-                padding: 0; 
-                height: 100vh; 
-                width: 100vw;
-                overflow-x: hidden;
-                overflow-y: auto;
-                position: relative;
-            }}
-            
-            .navbar-custom {{
-                background-color: #0066ff;
-                padding: 12px 16px;
-                display: flex;
-                flex-direction: column;
-                position: relative;
-                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-            }}
-            .navbar-top {{
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                width: 100%;
-            }}
-            .brand-title {{
-                color: #ffffff;
-                font-size: 22px;
-                font-weight: 700;
-                display: flex;
-                align-items: center;
-                gap: 8px;
-                text-decoration: none;
-            }}
-            .brand-title img, .brand-title i {{
-                font-size: 22px;
-                color: #ffffff;
-            }}
-            .menu-toggle-btn {{
-                background: transparent;
-                border: 2px solid rgba(255,255,255,0.6);
-                border-radius: 8px;
-                padding: 6px 12px;
-                color: white;
-                font-size: 18px;
-                cursor: pointer;
-            }}
-            .navbar-links {{
-                display: flex;
-                flex-direction: column;
-                gap: 12px;
-                margin-top: 14px;
-                padding-bottom: 5px;
-            }}
-            .nav-item-link {{
-                color: #ffffff;
-                text-decoration: none;
-                font-weight: 500;
-                font-size: 15px;
-                display: flex;
-                align-items: center;
-                gap: 8px;
-                opacity: 0.95;
-            }}
+            html, body {{ background-color: #f5f5f5; font-family: 'Roboto', sans-serif; margin: 0; padding: 0; height: 100vh; width: 100vw; overflow-x: hidden; overflow-y: auto; position: relative; }}
+            .navbar-custom {{ background-color: #0066ff; padding: 12px 16px; display: flex; flex-direction: column; position: relative; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
+            .navbar-top {{ display: flex; justify-content: space-between; align-items: center; width: 100%; }}
+            .brand-title {{ color: #ffffff; font-size: 22px; font-weight: 700; display: flex; align-items: center; gap: 8px; text-decoration: none; }}
+            .menu-toggle-btn {{ background: transparent; border: 2px solid rgba(255,255,255,0.6); border-radius: 8px; padding: 6px 12px; color: white; font-size: 18px; cursor: pointer; }}
+            .navbar-links {{ display: flex; flex-direction: column; gap: 12px; margin-top: 14px; padding-bottom: 5px; }}
+            .nav-item-link {{ color: #ffffff; text-decoration: none; font-weight: 500; font-size: 15px; display: flex; align-items: center; gap: 8px; opacity: 0.95; }}
             .nav-item-link:hover {{ opacity: 1; }}
-
-            .welcome-box {{
-                background-color: #e9e9e9;
-                border-radius: 4px;
-                padding: 14px 16px;
-                margin: 16px;
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                color: #333333;
-                font-size: 15px;
-                border: 1px solid #dddddd;
-            }}
-            .welcome-close {{
-                background: transparent;
-                border: none;
-                font-size: 18px;
-                color: #666666;
-                cursor: pointer;
-            }}
-
-            .search-box-container {{
-                margin: 0 16px 16px 16px;
-                display: flex;
-                justify-content: flex-end;
-                align-items: center;
-                gap: 6px;
-                color: #666666;
-                font-size: 14px;
-                cursor: pointer;
-            }}
-
-            .getkey-card {{
-                background: #ffffff;
-                border-radius: 0px;
-                border: 1px solid #dddddd;
-                margin: 0 16px 20px 16px;
-                box-shadow: 0 1px 3px rgba(0,0,0,0.05);
-            }}
-            .getkey-card-header {{
-                padding: 12px 16px;
-                font-weight: 700;
-                font-size: 16px;
-                color: #111111;
-                border-bottom: 1px solid #eeeeee;
-                display: flex;
-                align-items: center;
-                gap: 8px;
-                text-transform: uppercase;
-            }}
-            .getkey-card-body {{
-                padding: 20px 16px;
-            }}
-
-            .input-group-custom {{
-                display: flex;
-                width: 100%;
-                border: 1px solid #cccccc;
-                border-radius: 6px;
-                margin-bottom: 14px;
-                background-color: #ffffff;
-                overflow: hidden;
-            }}
-            .input-icon-prefix {{
-                background-color: #f0f0f0;
-                width: 46px;
-                display: flex;
-                justify-content: center;
-                align-items: center;
-                color: #444444;
-                border-right: 1px solid #cccccc;
-                font-size: 16px;
-            }}
-            .select-custom, .control-custom {{
-                flex: 1;
-                border: none !important;
-                background: transparent !important;
-                padding: 10px 12px;
-                font-size: 15px;
-                color: #111111;
-                outline: none;
-                font-weight: 400;
-            }}
-            .control-custom:disabled {{
-                background-color: #f8f8f8 !important;
-                color: #555555;
-            }}
-            .input-device-text {{
-                background-color: #f0f0f0;
-                padding: 0 16px;
-                display: flex;
-                align-items: center;
-                color: #222222;
-                font-weight: 400;
-                font-size: 14px;
-                border-left: 1px solid #cccccc;
-            }}
-
-            .action-buttons-group {{
-                display: grid;
-                grid-template-columns: 1fr 1fr;
-                gap: 12px;
-                margin-top: 20px;
-            }}
-            .btn-guide {{
-                background-color: #ffffff;
-                color: #0066cc;
-                border: 1px solid #0066cc;
-                border-radius: 6px;
-                padding: 10px;
-                font-weight: 500;
-                font-size: 14px;
-                display: flex;
-                flex-direction: column;
-                align-items: center;
-                justify-content: center;
-                text-decoration: none;
-                line-height: 1.3;
-            }}
-            .btn-generate {{
-                background-color: #0055ff;
-                color: #ffffff;
-                border: none;
-                border-radius: 6px;
-                padding: 10px;
-                font-weight: 500;
-                font-size: 14px;
-                display: flex;
-                flex-direction: column;
-                align-items: center;
-                justify-content: center;
-                box-shadow: 0 2px 4px rgba(0,85,255,0.2);
-                cursor: pointer;
-            }}
-            .btn-generate span, .btn-guide span {{
-                font-size: 14px;
-            }}
-
-            .info-notice {{
-                font-size: 12px;
-                color: #777777;
-                text-align: center;
-                margin: 15px 16px;
-                line-height: 1.5;
-            }}
-
-            .footer-copyright {{
-                text-align: center;
-                color: #777777;
-                font-size: 13px;
-                padding: 16px 0;
-                border-top: 1px solid #e0e0e0;
-                background-color: #f5f5f5;
-                margin-top: auto;
-                width: 100%;
-            }}
+            .welcome-box {{ background-color: #e9e9e9; border-radius: 4px; padding: 14px 16px; margin: 16px; display: flex; justify-content: space-between; align-items: center; color: #333333; font-size: 15px; border: 1px solid #dddddd; }}
+            .welcome-close {{ background: transparent; border: none; font-size: 18px; color: #666666; cursor: pointer; }}
+            .search-box-container {{ margin: 0 16px 16px 16px; display: flex; justify-content: flex-end; align-items: center; gap: 6px; color: #666666; font-size: 14px; cursor: pointer; }}
+            .getkey-card {{ background: #ffffff; border-radius: 0px; border: 1px solid #dddddd; margin: 0 16px 20px 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }}
+            .getkey-card-header {{ padding: 12px 16px; font-weight: 700; font-size: 16px; color: #111111; border-bottom: 1px solid #eeeeee; display: flex; align-items: center; gap: 8px; text-transform: uppercase; }}
+            .getkey-card-body {{ padding: 20px 16px; }}
+            .input-group-custom {{ display: flex; width: 100%; border: 1px solid #cccccc; border-radius: 6px; margin-bottom: 14px; background-color: #ffffff; overflow: hidden; }}
+            .input-icon-prefix {{ background-color: #f0f0f0; width: 46px; display: flex; justify-content: center; align-items: center; color: #444444; border-right: 1px solid #cccccc; font-size: 16px; }}
+            .select-custom, .control-custom {{ flex: 1; border: none !important; background: transparent !important; padding: 10px 12px; font-size: 15px; color: #111111; outline: none; font-weight: 400; }}
+            .control-custom:disabled {{ background-color: #f8f8f8 !important; color: #555555; }}
+            .input-device-text {{ background-color: #f0f0f0; padding: 0 16px; display: flex; align-items: center; color: #222222; font-weight: 400; font-size: 14px; border-left: 1px solid #cccccc; }}
+            .action-buttons-group {{ display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 20px; }}
+            .btn-guide {{ background-color: #ffffff; color: #0066cc; border: 1px solid #0066cc; border-radius: 6px; padding: 10px; font-weight: 500; font-size: 14px; display: flex; flex-direction: column; align-items: center; justify-content: center; text-decoration: none; line-height: 1.3; }}
+            .btn-generate {{ background-color: #0055ff; color: #ffffff; border: none; border-radius: 6px; padding: 10px; font-weight: 500; font-size: 14px; display: flex; flex-direction: column; align-items: center; justify-content: center; box-shadow: 0 2px 4px rgba(0,85,255,0.2); cursor: pointer; }}
+            .info-notice {{ font-size: 12px; color: #777777; text-align: center; margin: 15px 16px; line-height: 1.5; }}
+            .footer-copyright {{ text-align: center; color: #777777; font-size: 13px; padding: 16px 0; border-top: 1px solid #e0e0e0; background-color: #f5f5f5; margin-top: auto; width: 100%; }}
         </style>
     </head>
     <body>
-
         <div class="navbar-custom">
             <div class="navbar-top">
-                <a href="/" class="brand-title">
-                    <i class="fas fa-layer-group"></i> HELY
-                </a>
+                <a href="/" class="brand-title"><i class="fas fa-layer-group"></i> HELY</a>
                 <button class="menu-toggle-btn" onclick="toggleMenu()"><i class="fas fa-bars"></i></button>
             </div>
             <div class="navbar-links" id="navbarMenuLinks">
@@ -787,80 +553,31 @@ def get_key_portal():
             <button class="welcome-close" onclick="closeWelcome()">&times;</button>
         </div>
 
-        <div class="search-box-container">
-            <i class="fas fa-search"></i> <span>Tra cứu đơn hàng VIP</span>
-        </div>
+        <div class="search-box-container"><i class="fas fa-search"></i> <span>Tra cứu đơn hàng VIP</span></div>
 
         <div class="getkey-card">
-            <div class="getkey-card-header">
-                <i class="fas fa-gift"></i> Hệ thống GetKey
-            </div>
+            <div class="getkey-card-header"><i class="fas fa-gift"></i> Hệ thống GetKey</div>
             <div class="getkey-card-body">
                 <form action="/start_bypass" method="POST">
-                    
-                    <div class="input-group-custom">
-                        <div class="input-icon-prefix"><i class="fas fa-gamepad"></i></div>
-                        <select name="game" class="select-custom" required>
-                            <option value="" disabled selected>-- Chọn game --</option>
-                            {options_html}
-                        </select>
-                    </div>
-
-                    <div class="input-group-custom">
-                        <div class="input-icon-prefix"><i class="fas fa-mobile-alt"></i></div>
-                        <input type="text" class="control-custom" value="1" disabled>
-                        <div class="input-device-text">Thiết bị</div>
-                    </div>
-
-                    <div class="input-group-custom">
-                        <div class="input-icon-prefix"><i class="far fa-calendar-alt"></i></div>
-                        <input type="text" class="control-custom" value="Bảo lưu tự động" disabled>
-                    </div>
-
-                    <div class="input-group-custom">
-                        <div class="input-icon-prefix"><i class="far fa-gem"></i></div>
-                        <select name="steps" class="select-custom" required>
-                            <option value="1">FREE (Vượt quảng cáo gói 12H)</option>
-                            <option value="2">FREE (Vượt quảng cáo gói 24H)</option>
-                        </select>
-                    </div>
-
+                    <div class="input-group-custom"><div class="input-icon-prefix"><i class="fas fa-gamepad"></i></div><select name="game" class="select-custom" required><option value="" disabled selected>-- Chọn game --</option>{options_html}</select></div>
+                    <div class="input-group-custom"><div class="input-icon-prefix"><i class="fas fa-mobile-alt"></i></div><input type="text" class="control-custom" value="1" disabled><div class="input-device-text">Thiết bị</div></div>
+                    <div class="input-group-custom"><div class="input-icon-prefix"><i class="far fa-calendar-alt"></i></div><input type="text" class="control-custom" value="Bảo lưu tự động" disabled></div>
+                    <div class="input-group-custom"><div class="input-icon-prefix"><i class="far fa-gem"></i></div><select name="steps" class="select-custom" required><option value="1">FREE (Vượt quảng cáo gói 12H)</option><option value="2">FREE (Vượt quảng cáo gói 24H)</option></select></div>
                     <div class="action-buttons-group">
-                        <a href="#" class="btn-guide">
-                            <i class="far fa-question-circle mb-1" style="font-size: 16px;"></i>
-                            <span>Hướng dẫn<br>GetKey</span>
-                        </a>
-                        <button type="submit" class="btn-generate">
-                            <i class="fas fa-sign-in-alt mb-1" style="font-size: 16px;"></i>
-                            <span>Generate</span>
-                        </button>
+                        <a href="#" class="btn-guide"><i class="far fa-question-circle mb-1" style="font-size: 16px;"></i><span>Hướng dẫn<br>GetKey</span></a>
+                        <button type="submit" class="btn-generate"><i class="fas fa-sign-in-alt mb-1" style="font-size: 16px;"></i><span>Generate</span></button>
                     </div>
-
                 </form>
             </div>
         </div>
-
-        <div class="info-notice">
-            <i class="fas fa-info-circle"></i> Chọn game và nhấn Generate để bắt đầu.<br>
-            Thiết bị tối đa cho mỗi Key vượt link là 1 máy.
-        </div>
-
-        <div class="footer-copyright">
-            &copy; 2026 - Hely.dev
-        </div>
-
+        <div class="info-notice"><i class="fas fa-info-circle"></i> Chọn game và nhấn Generate để bắt đầu.<br>Thiết bị tối đa cho mỗi Key vượt link là 1 máy.</div>
+        <div class="footer-copyright">&copy; 2026 - Hely.dev</div>
         <script>
             function toggleMenu() {{
                 var menu = document.getElementById("navbarMenuLinks");
-                if (menu.style.display === "none" || menu.style.display === "") {{
-                    menu.style.display = "flex";
-                }} else {{
-                    menu.style.display = "none";
-                }}
+                menu.style.display = (menu.style.display === "none" || menu.style.display === "") ? "flex" : "none";
             }}
-            function closeWelcome() {{
-                document.getElementById("welcomeStrangerBox").style.display = "none";
-            }}
+            function closeWelcome() {{ document.getElementById("welcomeStrangerBox").style.display = "none"; }}
         </script>
     </body>
     </html>
@@ -926,7 +643,7 @@ def proxy_client_portal():
                     <p class="mb-2 fs-6"><b>Tình trạng:</b> <span id="keyStatusBadge"></span></p>
                     <p class="mb-2 fs-6"><b>Sảnh Chờ:</b> <span id="lobbyMsg" class="text-danger fw-bold"></span></p>
                     <p class="mb-2 fs-6"><b>Trong Game:</b> <span id="ingameMsg" class="text-success fw-bold"></span></p>
-                    <a id="activateGameBtn" href="#" class="btn-game"><i class="fas fa-gamepad"></i> KÍCH HOẠT VÀO SẢNH GAME</a>
+                    <a id="activateGameBtn" href="#" class="btn-game" onclick="activateGame(event)"><i class="fas fa-gamepad"></i> KÍCH HOẠT VÀO SẢNH GAME</a>
                 </div>
             </div>
         </div>
@@ -954,14 +671,11 @@ def proxy_client_portal():
                 .then(d => {{
                     var box = document.getElementById('statusBox');
                     box.style.display = 'block';
-                    
                     if(d.status === 'active') {{
                         document.getElementById('keyStatusBadge').innerHTML = '<span class="badge bg-success">Hoạt Động</span>';
                         document.getElementById('lobbyMsg').innerText = d.message;
                         document.getElementById('ingameMsg').innerText = d.ingame_message;
-                        
                         document.getElementById('activateGameBtn').style.display = 'block';
-                        document.getElementById('activateGameBtn').href = '/webview?key=' + encodeURIComponent(key);
                     }} else {{
                         document.getElementById('keyStatusBadge').innerHTML = '<span class="badge bg-danger">Hết Hạn / Bị Khóa / Sai Key</span>';
                         document.getElementById('lobbyMsg').innerText = d.message;
@@ -969,6 +683,44 @@ def proxy_client_portal():
                         document.getElementById('activateGameBtn').style.display = 'none';
                     }}
                 }}).catch(e => {{ Swal.fire('Lỗi', 'Lỗi kết nối máy chủ', 'error'); }});
+            }}
+            
+            // XỬ LÝ CHUẨN: BẤM NÚT TRUYỀN LỆNH LÊN TERMUX RỒI MỚI CHUYỂN SANG WEBVIEW
+            function activateGame(e) {{
+                e.preventDefault();
+                var key = document.getElementById('proxyKey').value.trim();
+                if(!key) return;
+                
+                Swal.fire({{
+                    title: 'Đang kết nối Termux...',
+                    text: 'Vui lòng chờ hệ thống mở cổng máy chủ mạng...',
+                    allowOutsideClick: false,
+                    didOpen: () => {{ Swal.showLoading(); }}
+                }});
+                
+                fetch('/api/proxy/activate_action', {{
+                    method: 'POST',
+                    headers: {{'Content-Type': 'application/json'}},
+                    body: JSON.stringify({{key: key}})
+                }})
+                .then(r => r.json())
+                .then(d => {{
+                    if(d.status === 'success') {{
+                        Swal.fire({{
+                            title: 'Thành Công', 
+                            text: d.message, 
+                            icon: 'success', 
+                            timer: 1500, 
+                            showConfirmButton: false
+                        }}).then(() => {{
+                            window.location.href = d.redirect;
+                        }});
+                    }} else {{
+                        Swal.fire('Lỗi Kết Nối', d.message, 'error');
+                    }}
+                }}).catch(e => {{
+                    Swal.fire('Lỗi', 'Không thể kết nối đến máy chủ web', 'error');
+                }});
             }}
         </script>
     </body>
@@ -978,19 +730,14 @@ def proxy_client_portal():
 def call_shortlink_api(url_to_shorten):
     db = load_db()
     api_token = db.get("settings", {}).get("shortlink_api_token", "4f62901315a7381c321f76bc988ff0e3").strip()
-    
     try:
         full_url = f"https://api.layma.net/api/admin/shortlink/quicklink?tokenUser={api_token}&format=json&url={urllib.parse.quote(url_to_shorten)}"
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
         res = requests.get(full_url, headers=headers, timeout=12).json()
-        
         if res.get("success") is True or res.get("status") == "success":
             short_link = res.get("html") or res.get("shortenedUrl") or res.get("short_url") or res.get("link")
-            if short_link:
-                return short_link
-    except Exception as e:
-        print("Lỗi tạo shortlink:", e)
-        
+            if short_link: return short_link
+    except: pass
     return f"https://google.com/search?q=Hệ+Thống+Vượt+Link+Đang+Bảo+Trì"
 
 @app.route('/start_bypass', methods=['POST'])
@@ -998,16 +745,8 @@ def start_bypass():
     game = request.form.get('game', 'GAME')
     steps = safe_int(request.form.get('steps', 1))
     if steps not in [1, 2]: steps = 1
-    
     session_id = secrets.token_hex(12)
-    bypass_sessions[session_id] = {
-        "game": game,
-        "steps": steps,
-        "current_step": 1,
-        "time": time.time(),
-        "ip": get_real_ip()
-    }
-    
+    bypass_sessions[session_id] = {"game": game, "steps": steps, "current_step": 1, "time": time.time(), "ip": get_real_ip()}
     return_url = f"{WEB_URL}/verify_bypass?session={session_id}"
     short_url = call_shortlink_api(return_url)
     return redirect(short_url)
@@ -1017,15 +756,12 @@ def verify_bypass():
     session_id = request.args.get('session')
     if not session_id or session_id not in bypass_sessions:
         return swal_redirect("Lỗi Vượt Link", "Phiên vượt link đã hết hạn hoặc không hợp lệ. Vui lòng làm lại từ đầu!", "error", "/")
-        
     s_data = bypass_sessions[session_id]
-    
     if s_data["current_step"] < s_data["steps"]:
         s_data["current_step"] += 1
         return_url = f"{WEB_URL}/verify_bypass?session={session_id}"
         short_url = call_shortlink_api(return_url)
         return redirect(short_url)
-        
     game_clean = re.sub(r'[^A-Z0-9_]', '', str(s_data["game"]).upper()[:10])
     hours = "12H" if s_data["steps"] == 1 else "24H"
     random_str = ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(5))
@@ -1033,78 +769,25 @@ def verify_bypass():
     
     db = load_db()
     with db_lock:
-        db["keys"][key_name] = {
-            "exp": "pending",
-            "maxDevices": 1,
-            "devices": [],
-            "vip": True,
-            "status": "active",
-            "bound_olm": "",
-            "proxy_host": "",
-            "proxy_port": 8080,
-            "ban_until": 0,
-            "note": f"Key Vượt Link {hours}",
-            "durationMs": (12 if hours == "12H" else 24) * 3600000
-        }
+        db["keys"][key_name] = {"exp": "pending", "maxDevices": 1, "devices": [], "vip": True, "status": "active", "bound_olm": "", "proxy_host": "", "proxy_port": 8080, "ban_until": 0, "note": f"Key Vượt Link {hours}", "durationMs": (12 if hours == "12H" else 24) * 3600000}
         save_db(db)
-        
     send_telegram_event('bypass_success', {'key': key_name, 'game': game_clean, 'hours': hours, 'ip': get_real_ip()})
     del bypass_sessions[session_id]
     
     return f'''
-    <!DOCTYPE html><html lang="vi">
-    <head>
-        <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>NHẬN KEY THÀNH CÔNG</title>
-        <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
-        <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
-        <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
-        <style>
-            @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
-            body {{ background-color: #f3f4f6; font-family: 'Inter', sans-serif; color: #1f2937; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }}
-            .result-box {{ background: rgba(255, 255, 255, 0.85); backdrop-filter: blur(20px); border: 1px solid #10b981; border-radius: 24px; padding: 40px 30px; width: 100%; max-width: 440px; text-align: center; box-shadow: 0 10px 40px rgba(16, 185, 129, 0.08); }}
-            .key-display {{ background: #f0fdf4; padding: 16px; font-size: 20px; font-family: monospace; font-weight: 700; color: #15803d; border-radius: 12px; border: 1px dashed #10b981; margin: 24px 0; letter-spacing: 0.5px; word-break: break-all; }}
-            .btn-copy {{ background: #10b981; color: #ffffff; font-weight: 700; padding: 13px; border-radius: 12px; width: 100%; border: none; transition: all 0.2s; margin-bottom: 12px; box-shadow: 0 4px 12px rgba(16, 185, 129, 0.2); }}
-            .btn-copy:hover {{ background: #059669; transform: translateY(-1px); box-shadow: 0 6px 20px rgba(16, 185, 129, 0.3); }}
-            .btn-home {{ background: transparent; color: #4b5563; border: 1px solid #d1d5db; padding: 11px; border-radius: 12px; width: 100%; font-weight: 600; text-decoration: none; display: inline-block; font-size: 14px; transition: 0.2s; }}
-            .btn-home:hover {{ background: #f9fafb; color: #111827; }}
-        </style>
-    </head>
-    <body>
-        <div class="container d-flex justify-content-center">
-            <div class="result-box">
-                <i class="fas fa-check-circle mb-3" style="font-size: 48px; color: #10b981;"></i>
-                <h4 class="fw-bold text-dark" style="letter-spacing: -0.5px;">VƯỢT LINK THÀNH CÔNG</h4>
-                <p class="text-muted small">Bạn đã nhận được KEY VIP. Vui lòng copy và dán mã bên dưới vào ứng dụng để sử dụng.</p>
-                
-                <div class="key-display" id="myKey">{key_name}</div>
-                
-                <button class="btn-copy" onclick="copyKey()"><i class="far fa-copy me-1"></i> Copy Key Ngay</button>
-                <a href="/" class="btn-home"><i class="fas fa-home me-1"></i> Trở về trang chủ</a>
-            </div>
-        </div>
-        <script>
-            function copyKey() {{
-                navigator.clipboard.writeText(document.getElementById("myKey").innerText);
-                Swal.fire({{toast: true, position: 'top-end', icon: 'success', title: 'Đã copy Key!', showConfirmButton: false, timer: 2000, background: '#ffffff', color: '#1f2937'}});
-            }}
-        </script>
-    </body>
-    </html>
+    <!DOCTYPE html><html lang="vi"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>NHẬN KEY THÀNH CÔNG</title><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet"><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet"><script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script><style>@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap'); body {{ background-color: #f3f4f6; font-family: 'Inter', sans-serif; color: #1f2937; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }} .result-box {{ background: rgba(255, 255, 255, 0.85); backdrop-filter: blur(20px); border: 1px solid #10b981; border-radius: 24px; padding: 40px 30px; width: 100%; max-width: 440px; text-align: center; box-shadow: 0 10px 40px rgba(16, 185, 129, 0.08); }} .key-display {{ background: #f0fdf4; padding: 16px; font-size: 20px; font-family: monospace; font-weight: 700; color: #15803d; border-radius: 12px; border: 1px dashed #10b981; margin: 24px 0; letter-spacing: 0.5px; word-break: break-all; }} .btn-copy {{ background: #10b981; color: #ffffff; font-weight: 700; padding: 13px; border-radius: 12px; width: 100%; border: none; transition: all 0.2s; margin-bottom: 12px; box-shadow: 0 4px 12px rgba(16, 185, 129, 0.2); }} .btn-copy:hover {{ background: #059669; transform: translateY(-1px); box-shadow: 0 6px 20px rgba(16, 185, 129, 0.3); }} .btn-home {{ background: transparent; color: #4b5563; border: 1px solid #d1d5db; padding: 11px; border-radius: 12px; width: 100%; font-weight: 600; text-decoration: none; display: inline-block; font-size: 14px; transition: 0.2s; }} .btn-home:hover {{ background: #f9fafb; color: #111827; }}</style></head><body><div class="container d-flex justify-content-center"><div class="result-box"><i class="fas fa-check-circle mb-3" style="font-size: 48px; color: #10b981;"></i><h4 class="fw-bold text-dark" style="letter-spacing: -0.5px;">VƯỢT LINK THÀNH CÔNG</h4><p class="text-muted small">Bạn đã nhận được KEY VIP. Vui lòng copy và dán mã bên dưới vào ứng dụng để sử dụng.</p><div class="key-display" id="myKey">{key_name}</div><button class="btn-copy" onclick="copyKey()"><i class="far fa-copy me-1"></i> Copy Key Ngay</button><a href="/" class="btn-home"><i class="fas fa-home me-1"></i> Trở về trang chủ</a></div></div><script>function copyKey() {{ navigator.clipboard.writeText(document.getElementById("myKey").innerText); Swal.fire({{toast: true, position: 'top-end', icon: 'success', title: 'Đã copy Key!', showConfirmButton: false, timer: 2000, background: '#ffffff', color: '#1f2937'}}); }}</script></body></html>
     '''
 
 @app.route('/api/verify_core', methods=['POST'])
 def api_verify_core():
     public_ip = get_real_ip()
     now = int(time.time() * 1000)
-
     with api_rate_lock:
         if len(api_rate_cache) > 5000:
             stale_ips = [k for k, v in api_rate_cache.items() if not v or now - v[-1] > 60000]
             for k in stale_ips: api_rate_cache.pop(k, None)
         reqs = api_rate_cache.get(public_ip, [])
         reqs = [t for t in reqs if now - t < 60000]
-        
         if len(reqs) >= 30: 
             db = load_db()
             with db_lock:
@@ -1123,7 +806,6 @@ def api_verify_core():
     android_version = data.get('android_version', '')
     client_ip = data.get('local_ip') or data.get('real_ip') or public_ip
     ua_string = request.headers.get('User-Agent', '')
-    
     if not android_version or android_version == 'Không rõ bản Android':
         a_match = re.search(r'Android\s+([0-9\.]+)', ua_string)
         android_version = f"Android {a_match.group(1)}" if a_match else "Không xác định"
@@ -1136,18 +818,15 @@ def api_verify_core():
         if public_ip in db.get("banned_ips", []): return jsonify({"status": "error", "msg": "Thiết bị của bạn đã bị chặn bởi tường lửa!"})
         if key not in db.get("keys", {}): return jsonify({"status": "error", "msg": "Mã Key không tồn tại hoặc sai định dạng!"})
         kd = db["keys"][key]
-        
         if kd.get("status") == "banned":
             ban_until = kd.get("ban_until", "permanent")
             if ban_until == "permanent" or (isinstance(ban_until, int) and ban_until > now): 
                 send_telegram_event('banned', {'key': key, 'ip': client_ip})
                 return jsonify({"status": "banned", "msg": "Key của bạn đang bị Admin khóa!", "ban_time": ban_until, "server_time": now})
             else: kd["status"] = "active"
-            
         if kd.get("exp") != "permanent" and kd.get("exp") != "pending" and kd.get("exp", 0) < now: 
             send_telegram_event('expired', {'key': key, 'ip': client_ip})
             return jsonify({"status": "error", "msg": "Key đã hết hạn sử dụng!"})
-
         devices = kd.setdefault("devices", [])
         connected_ips = kd.setdefault("connected_ips", [])
         if client_ip not in connected_ips:
@@ -1156,12 +835,10 @@ def api_verify_core():
 
         device_identifier = data.get('device_id', '') or data.get('uuid', '')
         if not device_identifier: device_identifier = f"{device_name} - {android_version}"
-            
         for item in list(devices):
             if ('.' in item and len(item.split('.')) == 4) or (':' in item):
                 try: devices.remove(item)
                 except: pass
-                
         if device_identifier not in devices:
             if len(devices) >= kd.get("maxDevices", 1): 
                 send_telegram_event('limit', {'key': key, 'ip': client_ip})
@@ -1182,12 +859,7 @@ def api_verify_core():
             
         save_db(db)
         send_telegram_event('login', {'key': key, 'ip': client_ip, 'device_name': device_name, 'android_version': android_version})
-        
-        is_vip = kd.get("vip", False)
-        core_code = db.get("settings", {}).get("script_tiem", "")
-        note_msg = kd.get("note", "") 
-            
-        return jsonify({"status": "ok", "is_vip": is_vip, "core": core_code, "exp": kd["exp"], "devices": len(devices), "max_devs": kd.get("maxDevices", 1), "server_time": now, "note": note_msg})
+        return jsonify({"status": "ok", "is_vip": kd.get("vip", False), "core": db.get("settings", {}).get("script_tiem", ""), "exp": kd["exp"], "devices": len(devices), "max_devs": kd.get("maxDevices", 1), "server_time": now, "note": kd.get("note", "")})
 
 @app.route('/admin_login', methods=['GET', 'POST'])
 def admin_login():
@@ -1195,7 +867,6 @@ def admin_login():
         ip = get_real_ip()
         global admin_login_attempts
         now = time.time()
-        
         with admin_login_lock:
             admin_login_attempts = {k: v for k, v in admin_login_attempts.items() if now - v['time'] < 300} 
             attempts = admin_login_attempts.get(ip, {'count': 0, 'time': now})
@@ -1213,19 +884,16 @@ def admin_login():
                 username = request.form.get('username', '').strip().lower()
                 pwd = request.form.get('password', '').strip()
                 u_data = db.get("users", {}).get(username)
-                
                 if u_data and u_data.get("role") == "admin" and hmac.compare_digest(u_data.get("password_hash"), hash_pwd(pwd)):
                     session['username'] = username
                     session['role'] = 'admin'
                     session['csrf_token'] = secrets.token_hex(16)
                     admin_login_attempts.pop(ip, None) 
                     return redirect('/admin')
-                
                 attempts['count'] += 1
                 attempts['time'] = now
                 admin_login_attempts[ip] = attempts
                 return swal_back("Từ Chối", f"Sai mật khẩu! Bạn còn {5 - attempts['count']} lần thử.", "error")
-            
         return f'''<!DOCTYPE html><html lang="vi"><head><title>C-Panel Admin Đăng Nhập</title><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet"><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet"><style>{CSS_GLASS} .inp-neon {{ background: #ffffff; border: 1px solid #cbd5e1; color: #1e293b; padding: 12px; border-radius: 8px; width: 100%; margin-bottom: 15px; outline: none; transition: 0.3s; text-align: center; }} .inp-neon:focus {{ border-color: #0f172a; box-shadow: 0 0 10px rgba(0,0,0,0.05); }}</style></head><body style="background:#f1f5f9; display:flex; justify-content:center; align-items:center; height:100vh;"><div class="container"><div class="glass-panel mx-auto" style="max-width:400px; background:#ffffff;"><h2 class="text-neon mb-4"><i class="fas fa-user-shield"></i> LVT C-PANEL</h2><form method="POST"><input type="text" name="username" class="inp-neon" placeholder="Tài khoản Quản Trị" required><input type="password" name="password" class="inp-neon" placeholder="Mật Khẩu" required><button type="submit" class="btn-neon mt-2"><i class="fas fa-sign-in-alt"></i> TRUY CẬP HỆ THỐNG</button></form></div></div></body></html>'''
     except Exception as e: return f"LỖI: {str(e)}", 200
 
@@ -1235,11 +903,9 @@ def admin_dashboard():
     db = load_db()
     token_url = session.get("csrf_token", "")
     csrf_input = f'<input type="hidden" name="csrf_token" value="{token_url}">'
-    
     with db_lock:
         keys_items = list(db.get("keys", {}).items())
         banned_ips = list(db.get("banned_ips", []))
-
     now_ms = int(time.time() * 1000)
     keys_html = ''
     for k, data in sorted(keys_items, key=lambda x: x[1].get('exp', 0) if isinstance(x[1].get('exp'), int) else 9999999999999, reverse=True):
@@ -1247,53 +913,38 @@ def admin_dashboard():
         st = data.get('status', 'active')
         ban_until = data.get("ban_until", 0)
         note = escape(data.get("note", ""))
-        
         if st == "banned":
             if ban_until == "permanent" or (isinstance(ban_until, int) and ban_until > now_ms): is_banned = True
             else: is_banned = False; data["status"] = "active" 
         else: is_banned = False
-
         if is_banned:
             status_badge = '<span class="badge badge-custom text-bg-danger"><i class="fas fa-ban"></i> Bị Khóa</span>'
             ban_btn = f'<a href="/admin/action/unban/{escape(str(k))}?csrf_token={token_url}" class="action-btn text-success" title="Mở khóa Key"><i class="fas fa-unlock"></i></a>'
         else:
             status_badge = '<span class="badge badge-custom text-bg-success"><i class="fas fa-check-circle"></i> Sống</span>'
             ban_btn = f'<button class="action-btn action-btn-danger" data-key="{escape(str(k))}" onclick="openBanModal(this.getAttribute(\'data-key\'))" title="Khóa (Kick)"><i class="fas fa-ban"></i></button>'
-
         vip_badge = '<span class="badge badge-custom" style="background:#0f172a; color:#fff;"><i class="fas fa-crown"></i> VIP</span>' if data.get('vip', False) else '<span class="badge badge-custom bg-secondary text-white">Thường</span>'
-        
         is_expired = False
         if data.get('exp') == 'pending': exp_text = '<span class="badge badge-custom bg-info text-dark">Chưa kích hoạt</span>'
         elif data.get('exp') == 'permanent': exp_text = '<span class="text-success fw-bold">Vĩnh Viễn</span>'
         else:
             is_expired = now_ms > data.get('exp', 0)
             exp_text = f'<span class="{"text-danger fw-bold" if is_expired else "text-dark font-weight-bold"}">{time.strftime("%d/%m/%y %H:%M", time.localtime(data.get("exp", 0) / 1000))}</span>'
-        
         if is_expired and not is_banned: status_badge = '<span class="badge badge-custom bg-secondary text-white">Hết hạn</span>'
-        
         safe_k = escape(str(k))
         bound_olm = escape(data.get('bound_olm', ''))
-
         keys_html += f'''<tr class="key-row">
-        <td>
-            <div class="fw-bold text-dark font-monospace mb-1" style="font-size:15px; cursor:pointer;" onclick="copyToClipboard('{safe_k}')">{safe_k} <i class="far fa-copy text-muted small"></i></div>
-            <div class="d-flex gap-1 justify-content-center">{vip_badge} {status_badge}</div>
-        </td>
-        <td>{exp_text}</td>
-        <td class="text-center"><span class="text-dark fw-bold">{bound_olm or '---'}</span></td>
+        <td><div class="fw-bold text-dark font-monospace mb-1" style="font-size:15px; cursor:pointer;" onclick="copyToClipboard('{safe_k}')">{safe_k} <i class="far fa-copy text-muted small"></i></div><div class="d-flex gap-1 justify-content-center">{vip_badge} {status_badge}</div></td>
+        <td>{exp_text}</td><td class="text-center"><span class="text-dark fw-bold">{bound_olm or '---'}</span></td>
         <td><span class="badge bg-light border border-secondary p-2 fs-6 text-dark">{len(data.get('devices', []))}/{data.get('maxDevices', 1)}</span></td>
-        <td>
-            <div class="d-flex flex-wrap gap-2 justify-content-center">
+        <td><div class="d-flex flex-wrap gap-2 justify-content-center">
                 <button class="action-btn text-dark" style="background: rgba(0,0,0,0.05);" data-key="{safe_k}" data-note="{note}" onclick="openNoteModal(this.getAttribute('data-key'), this.getAttribute('data-note'))" title="Ghi Chú"><i class="fas fa-sticky-note"></i></button>
                 <button class="action-btn text-dark" data-key="{safe_k}" data-olm="{bound_olm}" onclick="openBindModal(this.getAttribute('data-key'), this.getAttribute('data-olm'))" title="Ghim Tên"><i class="fas fa-user-tag"></i></button>
                 <button class="action-btn text-dark" data-key="{safe_k}" onclick="openAddTimeModal(this.getAttribute('data-key'))" title="Bơm Giờ"><i class="fas fa-clock"></i></button>
                 <a href="/admin/action/reset_dev/{safe_k}?csrf_token={token_url}" class="action-btn text-dark" onclick="return confirm('Xóa sạch lịch sử thiết bị của Key này?')" title="Reset Thiết Bị"><i class="fas fa-sync-alt"></i></a>
                 <button class="action-btn text-dark" data-key="{safe_k}" data-max="{data.get('maxDevices', 1)}" onclick="openMaxDevModal(this.getAttribute('data-key'), this.getAttribute('data-max'))" title="Giới Hạn Máy"><i class="fas fa-mobile-alt"></i></button>
-                {ban_btn}
-                <a href="/admin/action/delete/{safe_k}?csrf_token={token_url}" class="action-btn text-muted" onclick="return confirm('Xóa vĩnh viễn Key này?')" title="Xóa"><i class="fas fa-trash"></i></a>
-            </div>
-        </td>
-        </tr>'''
+                {ban_btn}<a href="/admin/action/delete/{safe_k}?csrf_token={token_url}" class="action-btn text-muted" onclick="return confirm('Xóa vĩnh viễn Key này?')" title="Xóa"><i class="fas fa-trash"></i></a>
+            </div></td></tr>'''
 
     blacklist_rows = "".join([f'<li class="list-group-item d-flex justify-content-between align-items-center" style="background:#fff;"><span class="font-monospace text-danger">{escape(ip)}</span> <a href="/admin/unban_ip/{escape(ip)}?csrf_token={token_url}" class="action-btn action-btn-danger px-3">Gỡ</a></li>' for ip in banned_ips])
 
@@ -1345,7 +996,6 @@ def admin_dashboard():
             <div class="nav-tabs-custom">
                 <a href="/admin" class="nav-btn active"><i class="fas fa-key"></i> QUẢN LÝ KEY & FIREWALL</a>
                 <a href="/admin/getkey" class="nav-btn"><i class="fas fa-link"></i> QUẢN LÝ VƯỢT LINK (GET KEY)</a>
-                <a href="/admin/files" class="nav-btn"><i class="fas fa-cloud-upload-alt"></i> AUTO NẠP FILE TRÊN MÂY</a>
                 <a href="/admin/proxy" class="nav-btn"><i class="fas fa-shield-alt"></i> PROXY & THÔNG BÁO</a>
             </div>
 
@@ -1463,19 +1113,15 @@ def admin_getkey_dashboard():
     
     keys_html = ''
     now_ms = int(time.time() * 1000)
-    
-    with db_lock:
-        keys_items = list(db.get("keys", {}).items())
+    with db_lock: keys_items = list(db.get("keys", {}).items())
         
     for k, data in sorted(keys_items, key=lambda x: x[1].get('exp', 0) if isinstance(x[1].get('exp'), int) else 9999999999999, reverse=True):
         if "Key Vượt Link" not in data.get("note", ""): continue
-        
         is_expired = False
         if data.get('exp') == 'pending': exp_text = '<span class="badge bg-info text-dark">Chưa kích hoạt</span>'
         else:
             is_expired = now_ms > data.get('exp', 0)
             exp_text = f'<span class="{"text-danger fw-bold" if is_expired else "text-success fw-bold"}">{time.strftime("%d/%m/%y %H:%M", time.localtime(data.get("exp", 0) / 1000))}</span>'
-            
         safe_k = escape(str(k))
         keys_html += f'''<tr>
             <td><div class="fw-bold text-dark font-monospace mb-1">{safe_k}</div></td>
@@ -1524,7 +1170,6 @@ def admin_getkey_dashboard():
             <div class="nav-tabs-custom">
                 <a href="/admin" class="nav-btn"><i class="fas fa-key"></i> QUẢN LÝ KEY & FIREWALL</a>
                 <a href="/admin/getkey" class="nav-btn active"><i class="fas fa-link"></i> QUẢN LÝ VƯỢT LINK (GET KEY)</a>
-                <a href="/admin/files" class="nav-btn"><i class="fas fa-cloud-upload-alt"></i> AUTO NẠP FILE TRÊN MÂY</a>
                 <a href="/admin/proxy" class="nav-btn"><i class="fas fa-shield-alt"></i> PROXY & THÔNG BÁO</a>
             </div>
 
@@ -1588,214 +1233,6 @@ def admin_update_getkey_settings():
         save_db(db)
     return swal_redirect("Thành Công", "Cập nhật cài đặt API Vượt Link thành công!", "success", "/admin/getkey")
 
-@app.route('/admin/files')
-def admin_files_dashboard():
-    if session.get('role') != 'admin': return redirect('/admin_login')
-    db = load_db()
-    csrf_input = f'<input type="hidden" name="csrf_token" value="{session.get("csrf_token", "")}">'
-    
-    with db_lock:
-        current_tiem_len = len(db.get("settings", {}).get("script_tiem", ""))
-        if current_tiem_len > 10: tiem_status = f'<span class="text-success fw-bold"><i class="fas fa-check-circle"></i> Đã nạp File Tiêm (Dung lượng: {current_tiem_len} bytes)</span>'
-        else: tiem_status = '<span class="text-danger fw-bold"><i class="fas fa-times-circle"></i> Chưa có Script Tiêm!</span>'
-
-        current_loader_len = len(db.get("settings", {}).get("vm_loader", ""))
-        if current_loader_len > 10: loader_status = f'<span class="text-success fw-bold"><i class="fas fa-check-circle"></i> Đã nạp Script (Dung lượng: {current_loader_len} bytes)</span>'
-        else: loader_status = '<span class="text-danger fw-bold"><i class="fas fa-times-circle"></i> Chưa có Script Violentmonkey!</span>'
-
-        current_webview_len = len(db.get("settings", {}).get("app_webview_code", ""))
-        if current_webview_len > 10: webview_status = f'<span class="text-success fw-bold"><i class="fas fa-check-circle"></i> Đã nạp Giao Diện ({current_webview_len} bytes)</span>'
-        else: webview_status = '<span class="text-danger fw-bold"><i class="fas fa-times-circle"></i> Chưa có Giao Diện App!</span>'
-
-        pak_path = './uploaded.pak'
-        if os.path.exists(pak_path):
-            pak_size = os.path.getsize(pak_path)
-            pak_status = f'<span class="text-success fw-bold"><i class="fas fa-check-circle"></i> Đã nạp File .PAK ({pak_size} bytes)</span>'
-        else:
-            pak_status = '<span class="text-danger fw-bold"><i class="fas fa-times-circle"></i> Chưa có File .PAK!</span>'
-            
-        is_maintenance = db.get("settings", {}).get("webview_maintenance", False)
-        maint_btn_text = "TẮT BẢO TRÌ WEBVIEW" if is_maintenance else "BẬT BẢO TRÌ WEBVIEW"
-        maint_btn_class = "btn-danger text-white" if is_maintenance else "btn-light text-dark"
-        maint_status_badge = '<span class="badge bg-danger ms-2">Đang Bảo Trì</span>' if is_maintenance else '<span class="badge bg-success ms-2">Online</span>'
-
-    return f'''
-    <!DOCTYPE html><html lang="vi">
-    <head>
-        <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>LVT C-Panel - Auto Nạp File</title>
-        <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
-        <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
-        <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
-        <style>
-            @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
-            body {{ background: #f8fafc; font-family: 'Inter', sans-serif; color: #334155; }}
-            .topbar {{ background: #ffffff; border-bottom: 1px solid #e2e8f0; padding: 15px 30px; display: flex; justify-content: space-between; align-items: center; position: sticky; top: 0; z-index: 1000; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }}
-            .topbar-brand {{ font-size: 20px; font-weight: 800; color: #0f172a; letter-spacing: 0.5px; display: flex; align-items: center; gap: 10px; }}
-            .card {{ background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; margin-bottom: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.02); }}
-            .card-header {{ background: #fafafa; border-bottom: 1px solid #e2e8f0; padding: 15px 20px; font-weight: 700; font-size: 14px; text-transform: uppercase; color: #0f172a; display: flex; align-items: center; justify-content: space-between; gap: 8px; }}
-            .card-body {{ padding: 20px; }}
-            .form-control {{ background: #ffffff !important; border: 1px solid #cbd5e1 !important; color: #1e293b !important; border-radius: 8px; padding: 10px 15px; font-size: 14px; transition: 0.2s; }}
-            .form-control:focus {{ border-color: #0f172a !important; box-shadow: 0 0 0 3px rgba(15,23,42,0.08) !important; outline: none; }}
-            .btn-primary-custom {{ background: linear-gradient(135deg, #1e293b, #0f172a); border: none; color: #fff; font-weight: 700; padding: 12px 20px; border-radius: 8px; transition: 0.3s; text-transform: uppercase; width: 100%; cursor:pointer; }}
-            .btn-primary-custom:hover {{ transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0,0,0,0.1); }}
-            .nav-tabs-custom {{ display: flex; gap: 15px; margin-bottom: 25px; border-bottom: 1px solid #e2e8f0; padding-bottom: 15px; }}
-            .nav-btn {{ padding: 12px 25px; border-radius: 8px; font-weight: 700; color: #475569; text-decoration: none; border: 1px solid #e2e8f0; background: #ffffff; transition: 0.3s; display: inline-flex; align-items: center; gap: 8px; }}
-            .nav-btn:hover {{ color: #0f172a; background: #f8fafc; }}
-            .nav-btn.active {{ background: #0f172a; color: #fff; border-color: #0f172a; box-shadow: 0 4px 12px rgba(15,23,42,0.15); }}
-        </style>
-    </head>
-    <body>
-        <div class="topbar">
-            <div class="topbar-brand"><i class="fas fa-server"></i> LVT C-PANEL</div>
-            <a href="/logout" class="btn btn-outline-danger btn-sm fw-bold px-3 py-2" style="border-radius: 8px;"><i class="fas fa-sign-out-alt"></i> Đăng xuất</a>
-        </div>
-        
-        <div class="container-fluid py-4 px-lg-5">
-            <div class="nav-tabs-custom">
-                <a href="/admin" class="nav-btn"><i class="fas fa-key"></i> QUẢN LÝ KEY & FIREWALL</a>
-                <a href="/admin/getkey" class="nav-btn"><i class="fas fa-link"></i> QUẢN LÝ VƯỢT LINK (GET KEY)</a>
-                <a href="/admin/files" class="nav-btn active"><i class="fas fa-cloud-upload-alt"></i> AUTO NẠP FILE TRÊN MÂY</a>
-                <a href="/admin/proxy" class="nav-btn"><i class="fas fa-shield-alt"></i> PROXY & THÔNG BÁO</a>
-            </div>
-            
-            <div class="card mb-4" style="border-top: 3px solid #10b981;">
-                <div class="card-header text-dark"><div><i class="fas fa-history"></i> KHÔI PHỤC DỮ LIỆU TỪ BACKUP TELEGRAM</div></div>
-                <div class="card-body">
-                    <form action="/admin/restore_db" method="POST" enctype="multipart/form-data" class="d-flex align-items-center gap-3">{csrf_input}
-                        <input type="file" name="db_file" class="form-control w-50" accept=".json" required>
-                        <button type="submit" class="btn-primary-custom" style="width:auto; border: 1px solid #0f172a;"><i class="fas fa-upload"></i> KHÔI PHỤC NGAY</button>
-                    </form>
-                </div>
-            </div>
-
-            <div class="row g-4">
-                <div class="col-xl-6 col-lg-6">
-                    <div class="card h-100" style="border-top: 3px solid #0f172a;">
-                        <div class="card-header"><div><i class="fas fa-code"></i> NẠP SCRIPT TIÊM GỐC</div></div>
-                        <div class="card-body d-flex flex-column">
-                            <form action="/admin/update_script_tiem" method="POST" enctype="multipart/form-data" class="h-100 d-flex flex-column">{csrf_input}
-                                <div class="mb-3 p-3 text-center" style="background: #f8fafc; border: 1px dashed #cbd5e1; border-radius: 8px;">{tiem_status}</div>
-                                <input type="file" name="script_file" class="form-control mb-2" accept=".js,.txt">
-                                <textarea name="script_text" class="form-control mb-3 flex-grow-1" rows="4" placeholder="Hoặc dán trực tiếp mã nguồn vào đây..."></textarea>
-                                <button type="submit" class="btn-primary-custom mt-auto"><i class="fas fa-cloud-upload-alt"></i> NẠP FILE SCRIPT TIÊM</button>
-                            </form>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="col-xl-6 col-lg-6">
-                    <div class="card h-100" style="border-top: 3px solid #0f172a;">
-                        <div class="card-header"><div><i class="fas fa-certificate"></i> NẠP SCRIPT VIOLENTMONKEY LOADER</div></div>
-                        <div class="card-body d-flex flex-column">
-                            <form action="/admin/update_vm_loader" method="POST" enctype="multipart/form-data" class="h-100 d-flex flex-column">{csrf_input}
-                                <div class="mb-3 p-3 text-center" style="background: #f8fafc; border: 1px dashed #cbd5e1; border-radius: 8px;">{loader_status}</div>
-                                <input type="file" name="loader_file" class="form-control mb-2" accept=".js,.txt">
-                                <textarea name="loader_text" class="form-control mb-3 flex-grow-1" rows="4" placeholder="Hoặc dán trực tiếp mã nguồn vào đây..."></textarea>
-                                <button type="submit" class="btn-primary-custom mt-auto"><i class="fas fa-cloud-upload-alt"></i> NẠP SCRIPT LOADER</button>
-                            </form>
-                        </div>
-                    </div>
-                </div>
-                
-                <div class="col-xl-6 col-lg-6">
-                    <div class="card h-100" style="border-top: 3px solid #0f172a;">
-                        <div class="card-header">
-                            <div><i class="fas fa-mobile-alt"></i> NẠP GIAO DIỆN WEBVIEW APP (.HTML)</div>
-                            <div>{maint_status_badge}</div>
-                        </div>
-                        <div class="card-body d-flex flex-column">
-                            <form action="/admin/toggle_maintenance" method="POST" class="mb-3">{csrf_input}
-                                <button type="submit" class="btn {maint_btn_class} w-100 fw-bold btn-sm py-2 border"><i class="fas fa-tools"></i> {maint_btn_text}</button>
-                            </form>
-                            <form action="/admin/update_webview" method="POST" enctype="multipart/form-data" class="h-100 d-flex flex-column">{csrf_input}
-                                <div class="mb-3 p-3 text-center" style="background: #f8fafc; border: 1px dashed #cbd5e1; border-radius: 8px;">{webview_status}</div>
-                                <input type="file" name="webview_file" class="form-control mb-2" accept=".html,.js,.txt">
-                                <textarea name="webview_text" class="form-control mb-3 flex-grow-1" rows="4" placeholder="Hoặc dán trực tiếp mã nguồn Webview vào đây..."></textarea>
-                                <button type="submit" class="btn-primary-custom mt-auto"><i class="fas fa-cloud-upload-alt"></i> NẠP GIAO DIỆN APP</button>
-                            </form>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="col-xl-6 col-lg-6">
-                    <div class="card h-100" style="border-top: 3px solid #0f172a;">
-                        <div class="card-header"><div><i class="fas fa-file-archive"></i> NẠP FILE .PAK (DATA)</div></div>
-                        <div class="card-body d-flex flex-column">
-                            <form id="pakUploadForm" action="/admin/update_pak" method="POST" enctype="multipart/form-data" class="h-100 d-flex flex-column">{csrf_input}
-                                <div class="mb-3 p-3 text-center" style="background: #f8fafc; border: 1px dashed #cbd5e1; border-radius: 8px;">{pak_status}</div>
-                                <input type="file" name="pak_file" class="form-control mb-2" accept=".pak">
-                                <input type="url" name="pak_url" class="form-control mb-3" placeholder="Hoặc dán Link trực tiếp tải file .pak (Direct URL)...">
-                                <div class="progress mb-3 d-none" id="pakUploadProgressContainer" style="height: 22px; border-radius: 8px;">
-                                    <div id="pakUploadProgressBar" class="progress-bar progress-bar-striped progress-bar-animated bg-success fw-bold" role="progressbar" style="width: 0%;">0%</div>
-                                </div>
-                                <div id="pakUploadStatusText" class="text-center small mb-2 text-primary fw-bold"></div>
-                                <button type="submit" class="btn-primary-custom mt-auto"><i class="fas fa-cloud-upload-alt"></i> NẠP FILE .PAK</button>
-                            </form>
-                            <script>
-                                document.getElementById('pakUploadForm').addEventListener('submit', function(e) {{
-                                    var fileInput = this.querySelector('input[name="pak_file"]');
-                                    var urlInput = this.querySelector('input[name="pak_url"]');
-                                    if (urlInput.value.trim() !== "") {{
-                                        return;
-                                    }}
-                                    if (!fileInput.files || fileInput.files.length === 0) {{
-                                        return;
-                                    }}
-                                    e.preventDefault();
-                                    var formData = new FormData(this);
-                                    var xhr = new XMLHttpRequest();
-                                    var pContainer = document.getElementById('pakUploadProgressContainer');
-                                    var pBar = document.getElementById('pakUploadProgressBar');
-                                    var pStatus = document.getElementById('pakUploadStatusText');
-                                    var btn = this.querySelector('button[type="submit"]');
-                                    
-                                    pContainer.classList.remove('d-none');
-                                    btn.disabled = true;
-                                    
-                                    xhr.upload.addEventListener('progress', function(e) {{
-                                        if (e.lengthComputable) {{
-                                            var percent = Math.round((e.loaded / e.total) * 100);
-                                            pBar.style.width = percent + '%';
-                                            pBar.innerText = percent + '%';
-                                            pStatus.innerText = "Đang nạp dữ liệu: " + (e.loaded / (1024*1024)).toFixed(1) + "MB / " + (e.total / (1024*1024)).toFixed(1) + "MB";
-                                        }}
-                                    }});
-                                    xhr.onreadystatechange = function() {{
-                                        if (xhr.readyState === 4) {{
-                                            btn.disabled = false;
-                                            if (xhr.status === 200) {{
-                                                try {{
-                                                    var res = JSON.parse(xhr.responseText);
-                                                    if (res.status === 'success') {{
-                                                        Swal.fire({{ title: 'Thành Công', html: res.message, icon: 'success', confirmButtonColor: '#0f172a' }}).then(() => {{ window.location.reload(); }});
-                                                    }} else {{
-                                                        Swal.fire({{ title: 'Lỗi', html: res.message, icon: 'error', confirmButtonColor: '#0f172a' }});
-                                                    }}
-                                                }} catch(err) {{
-                                                    window.location.reload();
-                                                }}
-                                            }} else {{
-                                                Swal.fire({{ title: 'Lỗi', html: 'Lỗi kết nối server hoặc kích thước quá giới hạn!', icon: 'error', confirmButtonColor: '#0f172a' }});
-                                            }}
-                                        }}
-                                    }};
-                                    xhr.open('POST', '/admin/update_pak', true);
-                                    xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
-                                    xhr.send(formData);
-                                }});
-                            </script>
-                        </div>
-                    </div>
-                </div>
-
-            </div>
-        </div>
-        <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
-    </body>
-    </html>
-    '''
-
 @app.route('/admin/proxy')
 def admin_proxy_dashboard():
     if session.get('role') != 'admin': return redirect('/admin_login')
@@ -1807,6 +1244,7 @@ def admin_proxy_dashboard():
     proxy_yaml_loader = escape(settings.get("proxy_yaml_loader", ""))
     msg_login = escape(settings.get("msg_login", "VUI LÒNG KÍCH HOẠT KEY ĐỂ VÀO GAME!"))
     msg_ingame = escape(settings.get("msg_ingame", "SẴN SÀNG CHIẾN ĐẤU - KEY ĐANG HOẠT ĐỘNG"))
+    termux_api_url = escape(settings.get("termux_api_url", ""))
     
     return f'''
     <!DOCTYPE html><html lang="vi">
@@ -1844,7 +1282,6 @@ def admin_proxy_dashboard():
             <div class="nav-tabs-custom">
                 <a href="/admin" class="nav-btn"><i class="fas fa-key"></i> QUẢN LÝ KEY & FIREWALL</a>
                 <a href="/admin/getkey" class="nav-btn"><i class="fas fa-link"></i> QUẢN LÝ VƯỢT LINK (GET KEY)</a>
-                <a href="/admin/files" class="nav-btn"><i class="fas fa-cloud-upload-alt"></i> AUTO NẠP FILE TRÊN MÂY</a>
                 <a href="/admin/proxy" class="nav-btn active"><i class="fas fa-shield-alt"></i> PROXY & THÔNG BÁO</a>
             </div>
 
@@ -1854,6 +1291,13 @@ def admin_proxy_dashboard():
                         <div class="card-header"><div><i class="fas fa-file-code"></i> Nạp Code Proxy (file.yaml) Tự Động</div></div>
                         <div class="card-body">
                             <form action="/admin/update_proxy_settings" method="POST" enctype="multipart/form-data">{csrf_input}
+                                
+                                <div class="mb-4 p-3 rounded" style="background:#fff1f2; border: 1px dashed #e11d48;">
+                                    <label class="text-danger fw-bold mb-1"><i class="fas fa-satellite-dish"></i> ĐƯỜNG DẪN API TERMUX (PINGGY/NGROK)</label>
+                                    <p class="small text-muted mb-2">Nhập link Pinggy của bạn để hệ thống có thể kết nối điều khiển bật mạng từ xa.</p>
+                                    <input type="text" name="termux_api_url" class="form-control border-danger font-monospace" value="{termux_api_url}" placeholder="VD: https://rnuv-113-161-64-162.a.pinggy.link">
+                                </div>
+
                                 <div class="mb-3">
                                     <label class="text-muted small fw-bold mb-1">Tải file .yaml GỐC lên</label>
                                     <input type="file" name="proxy_file" class="form-control" accept=".yaml,.yml,.txt">
@@ -1881,7 +1325,7 @@ def admin_proxy_dashboard():
                                     <textarea name="msg_ingame" class="form-control text-success fw-bold" rows="2" placeholder="SẴN SÀNG CHIẾN ĐẤU - KEY ĐANG HOẠT ĐỘNG">{msg_ingame}</textarea>
                                 </div>
 
-                                <button type="submit" class="btn-primary-custom"><i class="fas fa-save"></i> LƯU CẤU HÌNH PROXY & LOADER</button>
+                                <button type="submit" class="btn-primary-custom"><i class="fas fa-save"></i> LƯU TẤT CẢ CẤU HÌNH</button>
                             </form>
                         </div>
                     </div>
@@ -1891,10 +1335,10 @@ def admin_proxy_dashboard():
                     <div class="card h-100" style="border-top: 3px solid #0f172a;">
                         <div class="card-header text-dark"><div><i class="fas fa-info-circle"></i> Trạng Thái Auto Kiểm Tra Lõi</div></div>
                         <div class="card-body">
-                            <h5 class="text-dark fw-bold mb-3">Mô Tả Nâng Cấp:</h5>
+                            <h5 class="text-dark fw-bold mb-3">Mô Tả Nâng Cấp Tối Thượng:</h5>
                             <p class="text-muted"><i class="fas fa-check text-success"></i> <b>Cơ Chế File Loader:</b> Khách hàng chỉ cài Loader vào Clash Meta. File Loader sẽ ngầm gọi API để kéo file YAML Gốc về. Khi cần cập nhật mạng, Admin chỉ sửa file Gốc, mọi khách hàng sẽ tự động cập nhật mạng mới nhất mà không phải tải lại cấu hình.</p>
                             <p class="text-muted"><i class="fas fa-check text-success"></i> <b>Hệ thống Check Key Cực Mạnh:</b> HTML được nạp tự động nhúng tính năng gọi API 5 giây/lần. Khách hết hạn key lập tức văng về màn hình thông báo và bị khóa điều khiển.</p>
-                            <p class="text-muted"><i class="fas fa-check text-success"></i> <b>Kích Hoạt Vào Sảnh Game:</b> Khi nhập key đúng ở trang ngoài, nút <code>Vào Sảnh Game</code> sẽ kích hoạt, tự đưa vào thẳng link Webview tích hợp ID Key.</p>
+                            <p class="text-muted"><i class="fas fa-check text-success"></i> <b>Kích Hoạt Vào Sảnh Game (Pinggy Sync):</b> Khi khách nhập key đúng và bấm Kích hoạt, hệ thống Render sẽ tự động bắn API về Termux điện thoại của bạn, gỡ chặn luồng mạng rồi mới đẩy khách vào Webview.</p>
                             <hr>
                             <div class="p-3 mt-3" style="background:#f1f5f9; border-radius:8px;">
                                 <h6 class="fw-bold mb-2">Gợi ý Placeholder:</h6>
@@ -1926,6 +1370,7 @@ def admin_update_proxy_settings():
         
     msg_login = request.form.get("msg_login", "VUI LÒNG KÍCH HOẠT KEY ĐỂ VÀO GAME!").strip()
     msg_ingame = request.form.get("msg_ingame", "SẴN SÀNG CHIẾN ĐẤU - KEY ĐANG HOẠT ĐỘNG").strip()
+    termux_api = request.form.get("termux_api_url", "").strip()
     
     with db_lock:
         s = db.setdefault("settings", {})
@@ -1933,19 +1378,10 @@ def admin_update_proxy_settings():
         s["proxy_yaml_loader"] = loader_content
         s["msg_login"] = msg_login
         s["msg_ingame"] = msg_ingame
+        s["termux_api_url"] = termux_api
         save_db(db)
         
-    return swal_redirect("Thành Công", "Đã nạp file GỐC, LOADER và cấu hình thông báo thành công!", "success", "/admin/proxy")
-
-@app.route('/admin/toggle_maintenance', methods=['POST'])
-def admin_toggle_maintenance():
-    if session.get('role') != 'admin': return redirect('/admin_login')
-    db = load_db()
-    with db_lock:
-        current_status = db.setdefault("settings", {}).get("webview_maintenance", False)
-        db["settings"]["webview_maintenance"] = not current_status
-        save_db(db)
-    return redirect('/admin/files')
+    return swal_redirect("Thành Công", "Đã lưu lại cấu hình Proxy, Link Termux và Thông báo thành công!", "success", "/admin/proxy")
 
 @app.route('/admin/create', methods=['POST'])
 def create_key():
@@ -2076,95 +1512,6 @@ def admin_restore_db():
             _last_mtime_check = time.time()
     except Exception as e: return swal_back("Lỗi", f"Định dạng file không hợp lệ hoặc lỗi khôi phục: {escape_swal(str(e))}", "error")
     return swal_redirect("Khôi Phục Thành Công", "Đã khôi phục toàn bộ Key và Dữ Liệu gốc thành công!", "success", "/admin")
-
-@app.route('/admin/update_script_tiem', methods=['POST'])
-def admin_update_script_tiem():
-    if session.get('role') != 'admin': return redirect('/admin_login')
-    script_content = request.form.get('script_text', '').strip()
-    if not script_content and 'script_file' in request.files and request.files['script_file'].filename != '':
-        try: script_content = request.files['script_file'].read().decode('utf-8')
-        except: return swal_back("Lỗi", "File không hợp lệ (.js/.txt)", "error")
-    if not script_content: return swal_back("Lỗi", "Vui lòng chọn File hoặc dán Mã Nguồn!", "error")
-    db = load_db()
-    with db_lock:
-        db.setdefault("settings", {})["script_tiem"] = script_content
-        save_db(db)
-    return swal_redirect("Thành Công", "Đã nạp Script Tiêm thành công!", "success", "/admin/files")
-
-@app.route('/admin/update_vm_loader', methods=['POST'])
-def admin_update_vm_loader():
-    if session.get('role') != 'admin': return redirect('/admin_login')
-    script_content = request.form.get('loader_text', '').strip()
-    if not script_content and 'loader_file' in request.files and request.files['loader_file'].filename != '':
-        try: script_content = request.files['loader_file'].read().decode('utf-8')
-        except: return swal_back("Lỗi", "File không hợp lệ (.js/.txt)", "error")
-    if not script_content: return swal_back("Lỗi", "Vui lòng chọn File hoặc dán Mã Nguồn!", "error")
-    db = load_db()
-    with db_lock:
-        db.setdefault("settings", {})["vm_loader"] = script_content
-        save_db(db)
-    return swal_redirect("Thành Công", "Đã nạp Script Loader thành công!", "success", "/admin/files")
-
-@app.route('/admin/update_webview', methods=['POST'])
-def admin_update_webview():
-    if session.get('role') != 'admin': return redirect('/admin_login')
-    script_content = request.form.get('webview_text', '').strip()
-    if not script_content and 'webview_file' in request.files and request.files['webview_file'].filename != '':
-        try: script_content = request.files['webview_file'].read().decode('utf-8')
-        except: return swal_back("Lỗi", "File không hợp lệ (.html/.txt)", "error")
-    if not script_content: return swal_back("Lỗi", "Vui lòng chọn File hoặc dán Mã Nguồn!", "error")
-    db = load_db()
-    with db_lock:
-        db.setdefault("settings", {})["app_webview_code"] = script_content
-        save_db(db)
-    return swal_redirect("Thành Công", "Đã nạp Giao diện WebView thành công!", "success", "/admin/files")
-
-@app.route('/admin/update_pak', methods=['POST'])
-def admin_update_pak():
-    if session.get('role') != 'admin':
-        if request.headers.get('X-Requested-With') == 'XMLHttpRequest':
-            return jsonify({"status": "error", "message": "Hết phiên làm việc!"}), 401
-        return redirect('/admin_login')
-        
-    pak_url = request.form.get('pak_url', '').strip()
-    pak_path = './uploaded.pak'
-    temp_pak_path = './uploaded.pak.tmp'
-    is_ajax = request.headers.get('X-Requested-With') == 'XMLHttpRequest'
-    
-    try:
-        if pak_url:
-            r = requests.get(pak_url, stream=True, timeout=30)
-            r.raise_for_status()
-            with open(temp_pak_path, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=8192): f.write(chunk)
-            os.replace(temp_pak_path, pak_path)
-        else:
-            if 'pak_file' not in request.files or request.files['pak_file'].filename == '':
-                if is_ajax: return jsonify({"status": "error", "message": "Chưa chọn file hoặc dán Link URL!"})
-                return swal_back("Lỗi", "Chưa chọn file hoặc dán Link URL!", "error")
-            
-            file = request.files['pak_file']
-            with open(temp_pak_path, 'wb') as f:
-                while True:
-                    chunk = file.stream.read(64 * 1024) 
-                    if not chunk: break
-                    f.write(chunk)
-            os.replace(temp_pak_path, pak_path)
-            
-        db = load_db()
-        save_db(db)
-        
-        if is_ajax: 
-            return jsonify({"status": "success", "message": "Đã nạp file .PAK thành công!"})
-    except Exception as e:
-        if os.path.exists(temp_pak_path):
-            try: os.remove(temp_pak_path)
-            except: pass
-        err_msg = f"Không thể lưu file .pak: {escape_swal(str(e))}"
-        if is_ajax: return jsonify({"status": "error", "message": err_msg})
-        return swal_back("Lỗi", err_msg, "error")
-        
-    return swal_redirect("Thành Công", "Đã nạp file .PAK thành công!", "success", "/admin/files")
 
 @app.route('/admin/ban_ip', methods=['POST'])
 def web_ban_ip():
