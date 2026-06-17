@@ -134,7 +134,7 @@ def keep_awake():
             requests.get(WEB_URL, headers=headers, timeout=10)
         except Exception as e:
             pass
-        time.sleep(5 * 60)
+        time.sleep(4 * 60) # Tối ưu hóa ping giữ mạng Server cứ 4 phút một lần
 
 threading.Thread(target=keep_awake, daemon=True).start()
 
@@ -226,7 +226,6 @@ def load_db():
                 if "shortlink_api_token" not in data["settings"]: data["settings"]["shortlink_api_token"] = "4f62901315a7381c321f76bc988ff0e3"
 
                 if "proxy_yaml" not in data["settings"]: data["settings"]["proxy_yaml"] = ""
-                if "proxy_yaml_loader" not in data["settings"]: data["settings"]["proxy_yaml_loader"] = ""
                 if "msg_login" not in data["settings"]: data["settings"]["msg_login"] = "VUI LÒNG KÍCH HOẠT KEY ĐỂ VÀO GAME!"
                 if "msg_ingame" not in data["settings"]: data["settings"]["msg_ingame"] = "SẴN SÀNG CHIẾN ĐẤU - KEY ĐANG HOẠT ĐỘNG"
                 if "termux_api_url" not in data["settings"]: data["settings"]["termux_api_url"] = ""
@@ -372,11 +371,9 @@ def check_proxy_status():
         "status": "active", 
         "message": msg_login, 
         "ingame_message": msg_ingame,
-        "yaml_url": f"{WEB_URL}/api/proxy.yaml?key={key}",
-        "loader_url": f"{WEB_URL}/api/loader.yaml?key={key}"
+        "yaml_url": f"{WEB_URL}/api/proxy.yaml?key={key}"
     })
 
-# --- API CHUYÊN DỤNG ĐỂ GỌI XUỐNG TERMUX ---
 @app.route('/api/proxy/activate_action', methods=['POST'])
 def api_activate_action():
     data = request.json or {}
@@ -414,30 +411,29 @@ def download_proxy_yaml():
     key = request.args.get('key', '').strip()
     db = load_db()
     now = int(time.time() * 1000)
-    if not key or key not in db.get("keys", {}): return "Key không hợp lệ hoặc không được cung cấp.", 403
-    kd = db["keys"][key]
-    if kd.get("status") == "banned": return "Key đã bị khoá.", 403
-    if kd.get("exp") != "permanent" and kd.get("exp") != "pending" and kd.get("exp", 0) < now: return "Key đã hết hạn.", 403
-    yaml_content = db.get("settings", {}).get("proxy_yaml", "").replace("{KEY}", key)
-    resp = make_response(yaml_content)
-    resp.headers['Content-Type'] = 'text/yaml; charset=utf-8'
-    resp.headers['Content-Disposition'] = f'attachment; filename="proxy_{key}.yaml"'
-    return resp
+    
+    # Hàm đóng gói chuẩn YAML text (fix lỗi <!DOCTYPE html> trên app Clash)
+    def make_yaml_response(content):
+        resp = make_response(content, 200) # Luôn trả về 200 để ép cập nhật
+        resp.headers['Content-Type'] = 'text/yaml; charset=utf-8'
+        resp.headers['Content-Disposition'] = f'attachment; filename="proxy_{key}.yaml"'
+        return resp
+        
+    # Chuỗi Rule thông minh ép chặn mạng, đá người dùng về sảnh khi Key lỗi
+    block_rules = "mixed-port: 7890\nallow-lan: true\nmode: rule\nrules:\n  - MATCH,REJECT\n"
 
-@app.route('/api/loader.yaml')
-def download_loader_yaml():
-    key = request.args.get('key', '').strip()
-    db = load_db()
-    now = int(time.time() * 1000)
-    if not key or key not in db.get("keys", {}): return "Key không hợp lệ hoặc không được cung cấp.", 403
+    if not key or key not in db.get("keys", {}):
+        return make_yaml_response(block_rules)
+        
     kd = db["keys"][key]
-    if kd.get("status") == "banned": return "Key đã bị khoá.", 403
-    if kd.get("exp") != "permanent" and kd.get("exp") != "pending" and kd.get("exp", 0) < now: return "Key đã hết hạn.", 403
-    yaml_content = db.get("settings", {}).get("proxy_yaml_loader", "").replace("{KEY}", key)
-    resp = make_response(yaml_content)
-    resp.headers['Content-Type'] = 'text/yaml; charset=utf-8'
-    resp.headers['Content-Disposition'] = f'attachment; filename="loader_{key}.yaml"'
-    return resp
+    
+    # Nếu key hết hạn hoặc bị ban -> Trả về cấu hình chặn để ép văng ra sảnh Free Fire
+    if kd.get("status") == "banned" or (kd.get("exp") != "permanent" and kd.get("exp") != "pending" and kd.get("exp", 0) < now): 
+        return make_yaml_response(block_rules)
+        
+    # Key chuẩn, trả về YAML thật
+    yaml_content = db.get("settings", {}).get("proxy_yaml", "").replace("{KEY}", key)
+    return make_yaml_response(yaml_content)
 
 @app.route('/webview')
 def serve_webview_app():
@@ -585,142 +581,78 @@ def get_key_portal():
 
 @app.route('/proxy')
 def proxy_client_portal():
+    # Giao diện nâng cấp chuyên nghiệp đăng nhập Proxy
     return f'''
     <!DOCTYPE html><html lang="vi">
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-        <title>HELY - Quản Lý Proxy</title>
+        <title>Hệ Thống Xác Thực Proxy</title>
         <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
         <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
         <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
         <style>
-            @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap');
-            html, body {{ background-color: #f5f5f5; font-family: 'Roboto', sans-serif; margin: 0; padding: 0; height: 100vh; overflow-x: hidden; }}
-            .navbar-custom {{ background-color: #0066ff; padding: 12px 16px; display: flex; flex-direction: column; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
-            .navbar-top {{ display: flex; justify-content: space-between; align-items: center; width: 100%; }}
-            .brand-title {{ color: #ffffff; font-size: 22px; font-weight: 700; display: flex; align-items: center; gap: 8px; text-decoration: none; }}
-            .menu-toggle-btn {{ background: transparent; border: 2px solid rgba(255,255,255,0.6); border-radius: 8px; padding: 6px 12px; color: white; font-size: 18px; cursor: pointer; }}
-            .navbar-links {{ display: none; flex-direction: column; gap: 12px; margin-top: 14px; padding-bottom: 5px; }}
-            .nav-item-link {{ color: #ffffff; text-decoration: none; font-weight: 500; font-size: 15px; display: flex; align-items: center; gap: 8px; opacity: 0.95; }}
-            .getkey-card {{ background: #ffffff; border: 1px solid #dddddd; margin: 20px 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }}
-            .getkey-card-header {{ padding: 12px 16px; font-weight: 700; font-size: 16px; color: #111111; border-bottom: 1px solid #eeeeee; display: flex; align-items: center; gap: 8px; text-transform: uppercase; }}
-            .getkey-card-body {{ padding: 20px 16px; text-align: center; }}
-            .control-custom {{ width: 100%; border: 1px solid #cccccc; border-radius: 6px; padding: 12px; font-size: 15px; margin-bottom: 15px; outline: none; text-align: center; }}
-            .btn-generate {{ background-color: #0055ff; color: #ffffff; border: none; border-radius: 6px; padding: 12px; font-weight: 500; font-size: 14px; width: 100%; box-shadow: 0 2px 4px rgba(0,85,255,0.2); cursor: pointer; text-transform: uppercase; }}
-            .btn-clash {{ display: block; background: #10b981; color: white; border: none; border-radius: 6px; padding: 12px; font-weight: bold; font-size: 14px; width: 100%; box-shadow: 0 2px 4px rgba(16,185,129,0.3); cursor: pointer; text-transform: uppercase; text-decoration: none; }}
-            .btn-clash:hover {{ color: white; background: #059669; }}
-            .btn-game {{ display: none; background: #dc3545; color: white; border: none; border-radius: 6px; padding: 12px; font-weight: bold; font-size: 14px; width: 100%; box-shadow: 0 2px 4px rgba(220,53,69,0.3); cursor: pointer; text-transform: uppercase; text-decoration: none; margin-top: 15px; }}
-            .btn-game:hover {{ color: white; background: #c82333; }}
-            .status-box {{ display: none; background: #eef2ff; border: 1px dashed #6366f1; border-radius: 8px; padding: 15px; margin-top: 20px; text-align: left; }}
+            body {{ background: #0a0a0c; color: #ffffff; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }}
+            .login-container {{ background: #151518; padding: 40px 30px; border-radius: 16px; box-shadow: 0 0 40px rgba(0, 255, 136, 0.1); width: 100%; max-width: 420px; text-align: center; border: 1px solid #2a2a2f; position: relative; overflow: hidden; }}
+            .login-container::before {{ content: ""; position: absolute; top: 0; left: 0; width: 100%; height: 4px; background: linear-gradient(90deg, #00ff88, #00b3ff); }}
+            .title-text {{ font-weight: 800; font-size: 22px; margin-bottom: 25px; letter-spacing: 1px; color: #f0f0f0; }}
+            .form-control-custom {{ background: #1c1c20; border: 1px solid #333; color: #fff; border-radius: 10px; padding: 15px; font-size: 16px; text-align: center; margin-bottom: 20px; width: 100%; box-sizing: border-box; outline: none; transition: 0.3s; letter-spacing: 1px; }}
+            .form-control-custom:focus {{ border-color: #00ff88; box-shadow: 0 0 10px rgba(0, 255, 136, 0.2); }}
+            .btn-primary-action {{ background: linear-gradient(90deg, #00ff88, #00cc6a); color: #000; font-weight: 800; padding: 15px; width: 100%; border-radius: 10px; border: none; text-transform: uppercase; cursor: pointer; transition: 0.3s; font-size: 15px; letter-spacing: 1px; display: flex; align-items: center; justify-content: center; gap: 8px; }}
+            .btn-primary-action:hover {{ transform: translateY(-2px); box-shadow: 0 5px 15px rgba(0, 255, 136, 0.3); }}
+            .btn-clash-action {{ background: linear-gradient(90deg, #ff3366, #ff0044); color: #fff; font-weight: 800; padding: 15px; width: 100%; border-radius: 10px; border: none; text-transform: uppercase; cursor: pointer; transition: 0.3s; font-size: 15px; letter-spacing: 1px; display: flex; align-items: center; justify-content: center; gap: 8px; margin-top: 15px; }}
+            .btn-clash-action:hover {{ transform: translateY(-2px); box-shadow: 0 5px 15px rgba(255, 51, 102, 0.3); }}
+            #dashboardPanel {{ display: none; }}
+            .status-badge {{ background: rgba(0, 255, 136, 0.1); color: #00ff88; padding: 8px 16px; border-radius: 20px; font-size: 14px; font-weight: 600; display: inline-block; margin-bottom: 20px; border: 1px solid rgba(0, 255, 136, 0.3); }}
         </style>
     </head>
     <body>
-        <div class="navbar-custom">
-            <div class="navbar-top">
-                <a href="/" class="brand-title"><i class="fas fa-layer-group"></i> HELY</a>
-                <button class="menu-toggle-btn" onclick="toggleMenu()"><i class="fas fa-bars"></i></button>
+        <div class="login-container" id="loginPanel">
+            <div style="background: rgba(0, 255, 136, 0.1); width: 80px; height: 80px; border-radius: 50%; display: flex; align-items: center; justify-content: center; margin: 0 auto 20px auto;">
+                <i class="fas fa-shield-alt" style="font-size: 35px; color: #00ff88;"></i>
             </div>
-            <div class="navbar-links" id="navbarMenuLinks">
-                <a href="/" class="nav-item-link"><i class="fas fa-gift"></i> Get Free Key</a>
-                <a href="/proxy" class="nav-item-link"><i class="fas fa-shield-alt"></i> Quản Lý Proxy</a>
-                <a href="/admin_login" class="nav-item-link"><i class="fas fa-sign-in-alt"></i> Login</a>
-            </div>
+            <div class="title-text">HỆ THỐNG XÁC THỰC KEY</div>
+            <input type="text" id="proxyKey" class="form-control-custom" placeholder="Nhập Key VIP Của Bạn..." required autocomplete="off">
+            <button class="btn-primary-action" onclick="verifyKey()">XÁC THỰC KEY <i class="fas fa-arrow-right"></i></button>
         </div>
-
-        <div class="getkey-card">
-            <div class="getkey-card-header"><i class="fas fa-shield-alt"></i> Tra Cứu & Nạp Proxy Meta</div>
-            <div class="getkey-card-body">
-                <input type="text" id="proxyKey" class="control-custom" placeholder="Nhập Key VIP của bạn..." required>
-                
-                <div class="d-flex flex-column gap-2">
-                    <button type="button" class="btn-generate" onclick="checkKey()"><i class="fas fa-search me-1"></i> KIỂM TRA THÔNG TIN KEY</button>
-                    <button type="button" class="btn-clash" onclick="installLoader()"><i class="fas fa-download"></i> NẠP PROXY VÀO CLASH META (LOADER)</button>
-                </div>
-                
-                <div id="statusBox" class="status-box">
-                    <h6 class="fw-bold text-dark mb-3 border-bottom pb-2"><i class="fas fa-info-circle text-primary"></i> Trạng Thái Key</h6>
-                    <p class="mb-2 fs-6"><b>Tình trạng:</b> <span id="keyStatusBadge"></span></p>
-                    <p class="mb-2 fs-6"><b>Sảnh Chờ:</b> <span id="lobbyMsg" class="text-danger fw-bold"></span></p>
-                    <p class="mb-2 fs-6"><b>Trong Game:</b> <span id="ingameMsg" class="text-success fw-bold"></span></p>
-                    <a id="activateGameBtn" href="#" class="btn-game" onclick="activateGame(event)"><i class="fas fa-gamepad"></i> KÍCH HOẠT VÀO SẢNH GAME</a>
-                </div>
+        
+        <div class="login-container" id="dashboardPanel">
+            <div style="background: rgba(0, 255, 136, 0.1); width: 80px; height: 80px; border-radius: 50%; display: flex; align-items: center; justify-content: center; margin: 0 auto 20px auto;">
+                <i class="fas fa-check" style="font-size: 35px; color: #00ff88;"></i>
             </div>
+            <div class="title-text" style="color: #00ff88;">XÁC THỰC THÀNH CÔNG</div>
+            <div class="status-badge" id="statusMsg">Tài khoản hợp lệ</div>
+            <p style="color: #999; font-size: 14px; margin-bottom: 25px; line-height: 1.6;">Vui lòng ấn nút bên dưới để chuyển thẳng cấu hình VIP vào app Clash Meta của bạn.</p>
+            <button class="btn-clash-action" onclick="installClash()"><i class="fas fa-download"></i> NẠP FILE GỐC VÀO CLASH META</button>
         </div>
 
         <script>
-            function toggleMenu() {{
-                var menu = document.getElementById("navbarMenuLinks");
-                menu.style.display = (menu.style.display === "none" || menu.style.display === "") ? "flex" : "none";
-            }}
-            
-            function installLoader() {{
+            function verifyKey() {{
                 var key = document.getElementById('proxyKey').value.trim();
-                if(!key) {{ Swal.fire('Cảnh báo', 'Vui lòng điền Key VIP của bạn trước khi bấm nút Nạp Loader!', 'warning'); return; }}
-                var loaderUrl = "{WEB_URL}/api/loader.yaml?key=" + key;
-                var clashUrl = "clash://install-config?url=" + encodeURIComponent(loaderUrl) + "&name=" + encodeURIComponent("Loader_Proxy_" + key);
-                window.location.href = clashUrl;
-            }}
-            
-            function checkKey() {{
-                var key = document.getElementById('proxyKey').value.trim();
-                if(!key) {{ Swal.fire('Lỗi', 'Vui lòng nhập Key!', 'error'); return; }}
+                if(!key) {{ Swal.fire({{icon: 'error', title: 'Lỗi', text: 'Vui lòng nhập Key của bạn!', background: '#1c1c20', color: '#fff'}}); return; }}
+                
+                Swal.fire({{ title: 'Đang kiểm tra...', allowOutsideClick: false, background: '#1c1c20', color: '#fff', didOpen: () => {{ Swal.showLoading(); }} }});
                 
                 fetch('{WEB_URL}/api/proxy/status?key=' + key)
                 .then(r => r.json())
                 .then(d => {{
-                    var box = document.getElementById('statusBox');
-                    box.style.display = 'block';
+                    Swal.close();
                     if(d.status === 'active') {{
-                        document.getElementById('keyStatusBadge').innerHTML = '<span class="badge bg-success">Hoạt Động</span>';
-                        document.getElementById('lobbyMsg').innerText = d.message;
-                        document.getElementById('ingameMsg').innerText = d.ingame_message;
-                        document.getElementById('activateGameBtn').style.display = 'block';
+                        document.getElementById('loginPanel').style.display = 'none';
+                        document.getElementById('dashboardPanel').style.display = 'block';
                     }} else {{
-                        document.getElementById('keyStatusBadge').innerHTML = '<span class="badge bg-danger">Hết Hạn / Bị Khóa / Sai Key</span>';
-                        document.getElementById('lobbyMsg').innerText = d.message;
-                        document.getElementById('ingameMsg').innerText = "---";
-                        document.getElementById('activateGameBtn').style.display = 'none';
-                    }}
-                }}).catch(e => {{ Swal.fire('Lỗi', 'Lỗi kết nối máy chủ', 'error'); }});
-            }}
-            
-            // XỬ LÝ CHUẨN: BẤM NÚT TRUYỀN LỆNH LÊN TERMUX RỒI MỚI CHUYỂN SANG WEBVIEW
-            function activateGame(e) {{
-                e.preventDefault();
-                var key = document.getElementById('proxyKey').value.trim();
-                if(!key) return;
-                
-                Swal.fire({{
-                    title: 'Đang kết nối Termux...',
-                    text: 'Vui lòng chờ hệ thống mở cổng máy chủ mạng...',
-                    allowOutsideClick: false,
-                    didOpen: () => {{ Swal.showLoading(); }}
-                }});
-                
-                fetch('/api/proxy/activate_action', {{
-                    method: 'POST',
-                    headers: {{'Content-Type': 'application/json'}},
-                    body: JSON.stringify({{key: key}})
-                }})
-                .then(r => r.json())
-                .then(d => {{
-                    if(d.status === 'success') {{
-                        Swal.fire({{
-                            title: 'Thành Công', 
-                            text: d.message, 
-                            icon: 'success', 
-                            timer: 1500, 
-                            showConfirmButton: false
-                        }}).then(() => {{
-                            window.location.href = d.redirect;
-                        }});
-                    }} else {{
-                        Swal.fire('Lỗi Kết Nối', d.message, 'error');
+                        Swal.fire({{icon: 'error', title: 'Từ Chối', text: d.message || 'Key của bạn đã hết hạn hoặc không hợp lệ!', background: '#1c1c20', color: '#fff'}});
                     }}
                 }}).catch(e => {{
-                    Swal.fire('Lỗi', 'Không thể kết nối đến máy chủ web', 'error');
+                    Swal.fire({{icon: 'error', title: 'Lỗi Mạng', text: 'Không thể kết nối đến máy chủ', background: '#1c1c20', color: '#fff'}});
                 }});
+            }}
+
+            function installClash() {{
+                var key = document.getElementById('proxyKey').value.trim();
+                var yamlUrl = "{WEB_URL}/api/proxy.yaml?key=" + key;
+                var clashUrl = "clash://install-config?url=" + encodeURIComponent(yamlUrl) + "&name=" + encodeURIComponent("Proxy_VIP_" + key);
+                window.location.href = clashUrl;
             }}
         </script>
     </body>
@@ -1241,7 +1173,6 @@ def admin_proxy_dashboard():
     settings = db.get("settings", {})
     
     proxy_yaml = escape(settings.get("proxy_yaml", ""))
-    proxy_yaml_loader = escape(settings.get("proxy_yaml_loader", ""))
     msg_login = escape(settings.get("msg_login", "VUI LÒNG KÍCH HOẠT KEY ĐỂ VÀO GAME!"))
     msg_ingame = escape(settings.get("msg_ingame", "SẴN SÀNG CHIẾN ĐẤU - KEY ĐANG HOẠT ĐỘNG"))
     termux_api_url = escape(settings.get("termux_api_url", ""))
@@ -1288,7 +1219,7 @@ def admin_proxy_dashboard():
             <div class="row g-4">
                 <div class="col-xl-6 col-lg-12">
                     <div class="card h-100" style="border-top: 3px solid #10b981;">
-                        <div class="card-header"><div><i class="fas fa-file-code"></i> Nạp Code Proxy (file.yaml) Tự Động</div></div>
+                        <div class="card-header"><div><i class="fas fa-file-code"></i> Nạp Code Proxy GỐC</div></div>
                         <div class="card-body">
                             <form action="/admin/update_proxy_settings" method="POST" enctype="multipart/form-data">{csrf_input}
                                 
@@ -1304,21 +1235,13 @@ def admin_proxy_dashboard():
                                 </div>
                                 <div class="mb-3">
                                     <label class="text-muted small fw-bold mb-1">Hoặc dán trực tiếp mã nguồn YAML GỐC</label>
-                                    <textarea name="proxy_yaml" class="form-control font-monospace" rows="8" placeholder="Dán nội dung cấu hình Clash Meta GỐC vào đây...">{proxy_yaml}</textarea>
-                                </div>
-                                
-                                <div class="mb-3 pt-4 border-top border-2 border-primary">
-                                    <label class="text-dark fw-bold mb-1"><i class="fas fa-link"></i> NẠP LOADER (file.yaml loader)</label>
-                                    <p class="small text-muted mb-2">Code này sẽ được cấp cho khách. Khách nạp loader này vào Clash Meta, nó sẽ tự động kéo file gốc ẩn bên trong.</p>
-                                    <input type="file" name="loader_file" class="form-control mb-2" accept=".yaml,.yml,.txt">
-                                    <textarea name="proxy_yaml_loader" class="form-control font-monospace" rows="8" placeholder="Dán nội dung cấu hình LOADER vào đây... (Có thể chèn từ khóa {{{{KEY}}}})">{proxy_yaml_loader}</textarea>
+                                    <textarea name="proxy_yaml" class="form-control font-monospace" rows="12" placeholder="Dán nội dung cấu hình Clash Meta GỐC vào đây...">{proxy_yaml}</textarea>
                                 </div>
                                 
                                 <h5 class="fw-bold mt-4 mb-3 border-bottom pb-2">TÙY CHỈNH THÔNG BÁO AUTO CHECK</h5>
                                 <div class="mb-3">
                                     <label class="text-muted small fw-bold mb-1">Thông Báo Ở Sảnh Chờ Game (Khi hết hạn / Sai Key)</label>
                                     <textarea name="msg_login" class="form-control text-danger fw-bold" rows="2" placeholder="VUI LÒNG KÍCH HOẠT KEY ĐỂ VÀO GAME!">{msg_login}</textarea>
-                                    <small class="text-muted">Tính năng: Nếu khách hàng đang chơi mà key chết/hết hạn, màn hình sẽ tự động bị khóa và hiện thông báo này giống như đang kẹt ở sảnh chờ.</small>
                                 </div>
                                 <div class="mb-4">
                                     <label class="text-muted small fw-bold mb-1">Thông Báo Khi Đã Vào Trong Game (Nhân vật đang đứng)</label>
@@ -1333,16 +1256,16 @@ def admin_proxy_dashboard():
 
                 <div class="col-xl-6 col-lg-12">
                     <div class="card h-100" style="border-top: 3px solid #0f172a;">
-                        <div class="card-header text-dark"><div><i class="fas fa-info-circle"></i> Trạng Thái Auto Kiểm Tra Lõi</div></div>
+                        <div class="card-header text-dark"><div><i class="fas fa-info-circle"></i> Trạng Thái Kiểm Tra Lõi Thông Minh</div></div>
                         <div class="card-body">
-                            <h5 class="text-dark fw-bold mb-3">Mô Tả Nâng Cấp Tối Thượng:</h5>
-                            <p class="text-muted"><i class="fas fa-check text-success"></i> <b>Cơ Chế File Loader:</b> Khách hàng chỉ cài Loader vào Clash Meta. File Loader sẽ ngầm gọi API để kéo file YAML Gốc về. Khi cần cập nhật mạng, Admin chỉ sửa file Gốc, mọi khách hàng sẽ tự động cập nhật mạng mới nhất mà không phải tải lại cấu hình.</p>
-                            <p class="text-muted"><i class="fas fa-check text-success"></i> <b>Hệ thống Check Key Cực Mạnh:</b> HTML được nạp tự động nhúng tính năng gọi API 5 giây/lần. Khách hết hạn key lập tức văng về màn hình thông báo và bị khóa điều khiển.</p>
-                            <p class="text-muted"><i class="fas fa-check text-success"></i> <b>Kích Hoạt Vào Sảnh Game (Pinggy Sync):</b> Khi khách nhập key đúng và bấm Kích hoạt, hệ thống Render sẽ tự động bắn API về Termux điện thoại của bạn, gỡ chặn luồng mạng rồi mới đẩy khách vào Webview.</p>
+                            <h5 class="text-dark fw-bold mb-3">Mô Tả Nâng Cấp Tối Thượng Mới:</h5>
+                            <p class="text-muted"><i class="fas fa-check text-success"></i> <b>Cơ Chế Khóa Sảnh Chờ Bằng YAML:</b> Đã xóa bỏ tính năng Loader rườm rà. Hệ thống giờ nạp file gốc trực tiếp vào app. Nếu Key bị hết hạn, API trả về file yaml sẽ tự động được thay thế thành cấu hình <code>MATCH, REJECT</code>. Mọi kết nối bị chặn ép nhân vật văng ra sảnh Free Fire ngay lập tức.</p>
+                            <p class="text-muted"><i class="fas fa-check text-success"></i> <b>Không Gây Lỗi App:</b> Đã khắc phục triệt để lỗi <code>&lt;!DOCTYPE html&gt;</code> gây đứng app Clash. Cấu hình mới đảm bảo server luôn trả về Response chuẩn YAML dù có lỗi.</p>
+                            <p class="text-muted"><i class="fas fa-check text-success"></i> <b>Keep-Alive 4 Phút:</b> Tính năng chống ngủ đã được rút ngắn vòng lặp xuống 4 phút để giữ server luân phiên thức và chạy liên tục.</p>
                             <hr>
                             <div class="p-3 mt-3" style="background:#f1f5f9; border-radius:8px;">
                                 <h6 class="fw-bold mb-2">Gợi ý Placeholder:</h6>
-                                <p class="small text-dark mb-0">Trong mã nguồn file.yaml gốc và loader, bạn có thể nhập thẳng chuỗi <code>{{{{KEY}}}}</code>. Khi server truyền file xuống máy khách, chuỗi này sẽ tự động thay bằng Key VIP thực tế của họ.</p>
+                                <p class="small text-dark mb-0">Trong mã nguồn file.yaml gốc, bạn có thể nhập thẳng chuỗi <code>{{{{KEY}}}}</code>. Khi server truyền file xuống máy khách, chuỗi này sẽ tự động thay bằng Key VIP thực tế của họ.</p>
                             </div>
                         </div>
                     </div>
@@ -1363,11 +1286,6 @@ def admin_update_proxy_settings():
         try: yaml_content = request.files['proxy_file'].read().decode('utf-8')
         except: return swal_back("Lỗi", "File YAML Gốc không hợp lệ", "error")
         
-    loader_content = request.form.get('proxy_yaml_loader', '').strip()
-    if 'loader_file' in request.files and request.files['loader_file'].filename != '':
-        try: loader_content = request.files['loader_file'].read().decode('utf-8')
-        except: return swal_back("Lỗi", "File Loader không hợp lệ", "error")
-        
     msg_login = request.form.get("msg_login", "VUI LÒNG KÍCH HOẠT KEY ĐỂ VÀO GAME!").strip()
     msg_ingame = request.form.get("msg_ingame", "SẴN SÀNG CHIẾN ĐẤU - KEY ĐANG HOẠT ĐỘNG").strip()
     termux_api = request.form.get("termux_api_url", "").strip()
@@ -1375,13 +1293,12 @@ def admin_update_proxy_settings():
     with db_lock:
         s = db.setdefault("settings", {})
         s["proxy_yaml"] = yaml_content
-        s["proxy_yaml_loader"] = loader_content
         s["msg_login"] = msg_login
         s["msg_ingame"] = msg_ingame
         s["termux_api_url"] = termux_api
         save_db(db)
         
-    return swal_redirect("Thành Công", "Đã lưu lại cấu hình Proxy, Link Termux và Thông báo thành công!", "success", "/admin/proxy")
+    return swal_redirect("Thành Công", "Đã lưu lại cấu hình Proxy Gốc, Link Termux và Thông báo thành công!", "success", "/admin/proxy")
 
 @app.route('/admin/create', methods=['POST'])
 def create_key():
